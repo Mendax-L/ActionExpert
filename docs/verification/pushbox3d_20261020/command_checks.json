@@ -1,0 +1,45 @@
+{
+  "guide_matches_executed_recipe": true,
+  "powershell_blocks_parsed": 10,
+  "cli_parser_checks": [
+    {
+      "command": "learn.train",
+      "train_steps": 257,
+      "resume": null,
+      "parsed": true
+    },
+    {
+      "command": "learn.train",
+      "train_steps": 3000,
+      "resume": null,
+      "parsed": true
+    },
+    {
+      "command": "learn.train",
+      "train_steps": 6000,
+      "resume": "Z:\\ActionExpert\\outputs\\pushbox3d\\camera2_yaw_cw_run01\\policy.pt",
+      "parsed": true
+    },
+    {
+      "command": "inference.py",
+      "episodes": 1,
+      "parsed": true
+    },
+    {
+      "command": "inference.py",
+      "episodes": 50,
+      "parsed": true
+    }
+  ],
+  "actual_training_executed": false,
+  "source_hashes_unchanged_since_preflight": true,
+  "pip_check_actionexpert": "No broken requirements found.",
+  "pip_check_pushenv": "No broken requirements found.",
+  "record_validate_result": {
+    "frames": 34966,
+    "episodes": 100,
+    "tasks": 1,
+    "data_files": 100,
+    "video_files": 200
+  }
+}
