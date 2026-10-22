@@ -343,21 +343,22 @@ class SequenceDataset(Dataset):
         if episode_mask is None:
             episode_mask = np.ones(len(self.episode_ends), dtype=bool)
         self.episode_mask = np.asarray(episode_mask, dtype=bool)
+        self.action_offset = config.obs_horizon - 1
+        self.sequence_length = self.action_offset + config.action_horizon
+        self.pad_after = config.action_horizon - 1
         self.indices = build_sequence_indices(
             self.episode_ends,
-            sequence_length=config.horizon,
+            sequence_length=self.sequence_length,
             episode_mask=self.episode_mask,
-            pad_before=config.n_obs_steps - 1,
-            # Preserve the original recipe: permit up to K-1 repeated end actions.
-            pad_after=config.n_action_steps - 1,
+            pad_before=config.obs_horizon - 1,
+            pad_after=self.pad_after,
         )
         if sample_mask is not None:
             sample_mask = np.asarray(sample_mask, dtype=bool)
             if sample_mask.shape != (len(self.actions),):
                 raise ValueError("sample_mask must provide one boolean per dataset row.")
-            # Select windows by the first action actually executed, preserving
-            # real observation history and the complete future action target.
-            anchors = self.indices[:, 0] + config.action_start - self.indices[:, 2]
+            # Select by the current observation, independently of execution length.
+            anchors = self.indices[:, 0] + config.obs_horizon - 1 - self.indices[:, 2]
             anchors = np.clip(anchors, self.indices[:, 0], self.indices[:, 1] - 1)
             self.indices = self.indices[sample_mask[anchors]]
         if not len(self.indices):
@@ -388,18 +389,18 @@ class SequenceDataset(Dataset):
     def _padded_slice(self, values: np.ndarray, index: int, length: int | None = None) -> np.ndarray:
         source_start, source_end, destination_start, destination_end = self.indices[index]
         source = values[source_start:source_end]
-        offsets = np.clip(np.arange(self.config.horizon if length is None else length) - destination_start, 0, len(source) - 1)
+        offsets = np.clip(np.arange(self.sequence_length if length is None else length) - destination_start, 0, len(source) - 1)
         return np.asarray(source[offsets]).copy()
 
     def __getitem__(self, index: int) -> dict:
         sample = {
-            "obs": torch.from_numpy(self._padded_slice(self.observations, index)),
-            "action": torch.from_numpy(self._padded_slice(self.actions, index)),
+            "obs": torch.from_numpy(self._padded_slice(self.observations, index, self.config.obs_horizon)),
+            "action": torch.from_numpy(self._padded_slice(self.actions, index)[self.action_offset:]),
         }
         if self.images is not None:
             # Apply the identical temporal offsets, but copy only N observed RGB
             # frames instead of all H frames in the action prediction horizon.
-            images = self._padded_slice(self.images, index, self.config.n_obs_steps)
+            images = self._padded_slice(self.images, index, self.config.obs_horizon)
             sample["obs"] = {"state": sample["obs"], "image": torch.from_numpy(images.transpose(0, 3, 1, 2))}
         return sample
 

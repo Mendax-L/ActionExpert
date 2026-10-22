@@ -1,0 +1,16 @@
+# Unspecified options use the training/backend defaults.
+data:
+  dataset: ../../pushenv/training_data/lerobot/pusht
+  env_name: pusht
+obsencoder:
+  input_mode: structured_state
+  name: identity
+policy:
+  name: flowmatching
+  flowmatching:
+    network: mlp
+training:
+  output_dir: ../outputs/pusht/structured_state_run01
+  train_steps: 100000
+  val_ratio: 0.1
+  device: cuda

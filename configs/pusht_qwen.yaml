@@ -1,0 +1,17 @@
+data:
+  dataset: ../../pushenv/training_data/lerobot/pusht
+  env_name: pusht
+obsencoder:
+  input_mode: partial_obs
+  name: qwen
+  model_name: Qwen/Qwen3-VL-2B-Instruct
+  freeze_backbone: true
+policy:
+  name: flowmatching
+  flowmatching:
+    network: mlp
+training:
+  output_dir: ../outputs/pusht/qwen_run01
+  batch_size: 8
+  val_ratio: 0.1
+  device: cuda

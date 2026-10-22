@@ -1,6 +1,0 @@
-SETUP: real learn.train.main; stop before AdamW; decode all camera2 frames.
-Decoding observation.images.camera2 width=256
-FORWARD: one real batch, eval mode, no gradients.
-TCP: reload temporary untrained checkpoint; pushenv reset/render/predict.
-ENV_TCP_OK camera2 -> model -> action[8,3]; environment_steps=0
-PASS rows=34966 episodes=100 train_windows=8193 val_windows=904 steps_per_epoch=257 optimizer_steps=0

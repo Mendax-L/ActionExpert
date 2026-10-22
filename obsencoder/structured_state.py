@@ -1,17 +1,17 @@
-"""Keypoint/state normalization and optional learned projection."""
+"""Structured-state normalization and optional learned projection."""
 
 from torch import nn
 
 from .encoder import EncoderConfig, ObservationEncoder
 
 
-class KeypointObservationEncoder(ObservationEncoder):
-    """Normalize keypoint/state vectors; optionally learn an MLP projection."""
+class StructuredStateObservationEncoder(ObservationEncoder):
+    """Normalize structured-state vectors; optionally learn an MLP projection."""
 
     def __init__(self, obs_min, obs_max, config: EncoderConfig):
         super().__init__(obs_min, obs_max, config)
         if config.name not in {"identity", "mlp"}:
-            raise ValueError("Keypoint encoder requires identity or mlp.")
+            raise ValueError("Structured-state encoder requires identity or mlp.")
         self.output_dim = config.output_dim or self.input_dim
         if config.name == "identity":
             if self.output_dim != self.input_dim:

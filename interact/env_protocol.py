@@ -7,9 +7,11 @@ only when this file is executed by the pushenv interpreter.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import base64
 import binascii
 import json
+from datetime import datetime
 from pathlib import Path
 import sys
 import math
@@ -17,9 +19,31 @@ import socket
 import struct
 import threading
 from typing import Any, Callable
+from uuid import uuid4
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 1_048_576
+
+
+def interaction_output(checkpoint, output=None):
+    """Keep reports/videos in a subdirectory of the checkpoint's training run."""
+    if not checkpoint:
+        raise ValueError("Model health must include its checkpoint path to locate interaction outputs.")
+    root = Path(checkpoint).resolve().parent
+    if output is None:
+        run = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
+        return root / "inference" / run / "metrics.json"
+    output = Path(output).expanduser()
+    # Existing project-relative --output paths remain supported; short relative
+    # paths such as inference/demo/metrics.json are relative to the training run.
+    candidate = output.resolve()
+    if not output.is_absolute() and not candidate.is_relative_to(root):
+        candidate = (root / output).resolve()
+    if not candidate.is_relative_to(root) or candidate.parent == root:
+        raise ValueError(f"Interaction output must be in a subdirectory of {root}.")
+    if candidate.suffix.lower() != ".json":
+        raise ValueError("Interaction output must name a .json report.")
+    return candidate
 
 
 def _image_history_shape(shape):
@@ -266,9 +290,19 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
             import cv2
     pool = ObsPool(obs_shape[0], environment.obs_dim, image_shape, image_key)
     spatial = environment.name == "pushbox3d"
-    visual_only = bool(health.get("visual_only", False))
-    if visual_only and image_shape is None:
-        raise ValueError("A visual-only policy must declare an RGB image shape.")
+    input_mode = health.get("input_mode")
+    if input_mode not in {"structured_state", "partial_obs"}:
+        raise ValueError("Policy input_mode must be structured_state or partial_obs.")
+    if (input_mode == "partial_obs") != (image_shape is not None):
+        raise ValueError("Policy input mode disagrees with its image/state configuration.")
+    policy_input = {"mode": input_mode, "image_key": image_key if image_shape is not None else None,
+                    "image_shape": image_shape, "state_dim": 0 if input_mode == "partial_obs" else environment.obs_dim}
+
+    def render_views():
+        if spatial:
+            streams = environment.render_preview()
+            return {"overview": streams["Overview"], "camera2": streams["Closeup"]}
+        return {"overview": environment.render()}
 
     if show:
         import pygame
@@ -278,22 +312,22 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
         preview_font = pygame.font.Font(None, 24)
         preview_clock = pygame.time.Clock()
 
-    def preview(episode, step, info):
+    def preview(episode, step, info, streams):
         if not show:
             return
         for event in pygame.event.get():
             if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
                 raise KeyboardInterrupt("Evaluation preview closed.")
         preview_window.fill((24, 24, 28))
-        streams = environment.render_preview() if spatial else {"Overview": environment.render()}
-        status = f"Episode {episode + 1}/{episodes}  seed={seed + episode}  step={step}  phase={info.get('phase', '')}  success={info.get('success', False)}"
+        status = f"Episode {episode + 1}/{episodes}  seed={seed + episode}  step={step}  input={input_mode}  phase={info.get('phase', '')}  success={info.get('success', False)}"
         preview_window.blit(preview_font.render(status, True, (245, 245, 245)), (12, 10))
         for column, (name, frame) in enumerate(streams.items()):
             pixels = pygame.surfarray.make_surface(np.asarray(frame).swapaxes(0, 1))
             pixels = pygame.transform.smoothscale(pixels, (512, round(512 * frame.shape[0] / frame.shape[1])))
             x, y = column * 512, 64 + (512 - pixels.get_height()) // 2
             preview_window.blit(pixels, (x, y))
-            label = f"{name} (camera2 policy input)" if name == "Closeup" else name
+            camera_key = "observation.images.camera2" if name == "camera2" else "observation.images.front"
+            label = f"{name} (policy input)" if image_shape is not None and image_key == camera_key else name
             preview_window.blit(preview_font.render(label, True, (245, 245, 245)), (x + 12, 38))
         pygame.display.flip()
         preview_clock.tick(environment.fps)
@@ -307,15 +341,14 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
             raise ValueError("Rendered RGB pixels differ from the environment camera schema.")
         if tuple(image_shape) != source_image_shape:
             image = cv2.resize(image, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_AREA)
-        return {"observation.state": np.zeros(environment.obs_dim, dtype=np.float32) if visual_only else state,
+        return {"observation.state": np.zeros(environment.obs_dim, dtype=np.float32),
                 image_key: image}
 
     def policy_observation():
         observation = pool.observation()
         if image_shape is None:
             return observation.tolist()
-        state = np.zeros_like(observation["state"]) if visual_only else observation["state"]
-        return {"observation.state": state.tolist(),
+        return {"observation.state": observation["state"].tolist(),
                 "image": pack_image(observation["image"])}
 
     diagnostic_keys = ("phase", "xy_error", "yaw_error", "tilt", "height", "height_error",
@@ -333,14 +366,22 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
         exchange(connection, {"op": "reset", "seed": episode_seed})
         pool.clear()
         pool.append(observe(environment.reset(episode_seed)))
-        writer = None
-        video_path = None
+        writers, video_paths = {}, {}
+        video_stack = ExitStack()
         total_reward, score, steps = 0.0, float("-inf"), 0
         success, success_known, terminated, truncated = False, False, False, False
         transitions = []
         final_info = {}
         budget_exhausted = False
         tail_exhausted = False
+
+        def capture(info):
+            if not writers and not show:
+                return
+            streams = render_views()
+            for view, writer in writers.items():
+                writer.append_data(streams[view])
+            preview(episode, steps, info, streams)
 
         def consume(action, plan_index, plan_length):
             nonlocal total_reward, score, steps, success, success_known, terminated, truncated, final_info
@@ -370,20 +411,22 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
             final_info = {"success": current_success, **diagnostics(transition.info)}
             trace.update(diagnostics(transition.info))
             transitions.append(trace)
-            if writer is not None:
-                writer.append_data(environment.render())
-            preview(episode, steps, transition.info)
+            capture(transition.info)
             return transition
 
         try:
-            preview(episode, 0, {})
             if video_dir is not None:
                 import imageio.v2 as imageio
                 video_dir.mkdir(parents=True, exist_ok=True)
-                video_path = video_dir / f"{environment.name}-{episode_seed}.mp4"
-                writer = imageio.get_writer(video_path, fps=environment.fps, codec="libx264",
-                                           pixelformat="yuv420p", macro_block_size=None, ffmpeg_log_level="error")
-                writer.append_data(environment.render())
+                for view in (("overview", "camera2") if spatial else ("overview",)):
+                    suffix = "" if view == "overview" else f"-{view}"
+                    path = video_dir / f"{environment.name}-{episode_seed}{suffix}.mp4"
+                    writer = imageio.get_writer(path, fps=environment.fps, codec="libx264",
+                                               pixelformat="yuv420p", macro_block_size=None, ffmpeg_log_level="error")
+                    video_stack.callback(writer.close)
+                    writers[view] = writer
+                    video_paths[view] = str(path.resolve())
+            capture({})
             while steps < max_steps and not (terminated or truncated):
                 if spatial and environment.environment.phase != "control":
                     actions = np.zeros((1, environment.action_dim), dtype=np.float32)
@@ -413,11 +456,10 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
                 if not terminated:
                     truncated = True
         finally:
-            if writer is not None:
-                writer.close()
+            video_stack.close()
         results.append({"seed": episode_seed, "steps": steps, "score": score, "return": total_reward,
                         "success": success, "success_known": success_known, "terminated": terminated,
-                        "truncated": truncated, "video": str(video_path.resolve()) if video_path else None,
+                        "truncated": truncated, "video": video_paths.get("overview"), "videos": video_paths,
                         "budget_exhausted": budget_exhausted, "tail_exhausted": tail_exhausted,
                         "final_info": final_info, "transitions": transitions})
         print(f"ROLLOUT_OK env={environment.name} seed={episode_seed} steps={steps} score={score:.4f} "
@@ -425,6 +467,8 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
     known_results = [result for result in results if result["success_known"]]
     return {"environment": environment.name, "episodes": episodes, "fps": environment.fps,
             "seed_start": seed, "max_steps": max_steps,
+            "policy_input": policy_input,
+            "success_criteria": schema.get("episode_lifecycle", {}),
             "success_definition": "native environment success after physical landing and settling" if spatial else "native environment success",
             "environment_contract": contract, "mean_score": float(np.mean([result["score"] for result in results])),
             "mean_return": float(np.mean([result["return"] for result in results])),
@@ -442,7 +486,7 @@ def main():
     parser.add_argument("--seed", type=int, default=100_000)
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--socket-timeout", type=float, default=120.0)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, help="Report inside the model's training directory; default: inference/<timestamp>/metrics.json.")
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--show", action="store_true", help="Show live overview/camera2 evaluation preview; Esc closes it.")
     args = parser.parse_args()
@@ -460,6 +504,7 @@ def main():
             health = exchange(connection, {"op": "health", "protocol": PROTOCOL_VERSION})
             if health.get("protocol") != PROTOCOL_VERSION or health.get("env", "").lower() == Path(sys.prefix).name.lower():
                 raise RuntimeError("Protocol mismatch or model/environment runtime isolation violation.")
+            args.output = interaction_output(health.get("checkpoint"), args.output)
             image_shape = health.get("image_shape")
             if image_shape is not None:
                 _image_history_shape([health["obs_shape"][0], *image_shape])
@@ -481,6 +526,9 @@ def main():
             except (OSError, ValueError, RuntimeError):
                 pass
     report["model_runtime"] = health
+    report["checkpoint"] = health["checkpoint"]
+    report["interaction_config"] = {key: str(value.resolve()) if isinstance(value, Path) else value
+                                    for key, value in vars(args).items()}
     report["environment_runtime"] = {"env": Path(sys.prefix).name, "executable": sys.executable}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")

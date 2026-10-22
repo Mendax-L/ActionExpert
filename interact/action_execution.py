@@ -1,11 +1,13 @@
-"""Normalize training actions; convert predictions back to environment units."""
+"""Normalize actions, restore environment units and select execution steps."""
+
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 
 
 class ActionStandardizer(nn.Module):
-    def __init__(self, action_min, action_max, low, high, action_start, act_horizon, groups=None):
+    def __init__(self, action_min, action_max, low, high, groups=None):
         super().__init__()
         self.register_buffer("action_min", torch.as_tensor(action_min, dtype=torch.float32).reshape(-1))
         device = self.action_min.device
@@ -19,9 +21,6 @@ class ActionStandardizer(nn.Module):
             raise ValueError("Action bounds must be ordered.")
         if (self.action_min < self.low - 1e-4).any() or (self.action_max > self.high + 1e-4).any():
             raise ValueError("Training action extrema exceed environment bounds.")
-        if type(action_start) is not int or action_start < 0 or type(act_horizon) is not int or act_horizon < 1:
-            raise ValueError("Action start and horizon must be valid integers.")
-        self.action_start, self.act_horizon = action_start, act_horizon
         self.groups = groups or {}
 
     def normalize(self, actions):
@@ -36,14 +35,37 @@ class ActionStandardizer(nn.Module):
 
     def forward(self, normalized_actions):
         self._validate(normalized_actions)
-        end = self.action_start + self.act_horizon
-        if end > normalized_actions.shape[1]:
-            raise ValueError("Executed action slice exceeds prediction horizon.")
         prediction = (normalized_actions + 1) * 0.5 * (self.action_max - self.action_min) + self.action_min
         if not torch.isfinite(prediction).all():
             raise ValueError("Action denormalization produced non-finite values.")
-        action = prediction[:, self.action_start:end].clamp(min=self.low, max=self.high)
-        return {"action": action, "action_pred": prediction}
+        return prediction.clamp(min=self.low, max=self.high)
 
     def split(self, actions):
         return {name: actions[..., indices] for name, indices in self.groups.items()}
+
+
+@dataclass(frozen=True)
+class ActionExecution:
+    execute_steps: int = 8
+
+    def __post_init__(self):
+        if type(self.execute_steps) is not int or self.execute_steps < 1:
+            raise ValueError("execute_steps must be a positive integer.")
+
+    def validate(self, action_horizon):
+        if self.execute_steps > action_horizon:
+            raise ValueError("Executed action slice exceeds action_horizon.")
+
+    @classmethod
+    def for_horizon(cls, action_horizon, execute_steps=None):
+        if execute_steps is None:
+            execute_steps = min(8, action_horizon)
+        selection = cls(execute_steps=execute_steps)
+        selection.validate(action_horizon)
+        return selection
+
+    def __call__(self, actions):
+        if actions.ndim != 3:
+            raise ValueError("Actions must have shape [B, action_horizon, action_dim].")
+        self.validate(actions.shape[1])
+        return actions[:, :self.execute_steps]

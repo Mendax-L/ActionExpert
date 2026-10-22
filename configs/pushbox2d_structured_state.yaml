@@ -1,0 +1,17 @@
+data:
+  dataset: ../../pushenv/training_data/lerobot/pushbox2d/human-20261015-164705-581008
+  env_name: pushbox2d
+obsencoder:
+  input_mode: structured_state
+  name: identity
+policy:
+  name: flowmatching
+  action_horizon: 8
+  flowmatching:
+    network: mlp
+training:
+  output_dir: ../outputs/pushbox2d/structured_state_run01
+  train_steps: 2000
+  batch_size: 32
+  val_ratio: 0.1
+  device: cuda

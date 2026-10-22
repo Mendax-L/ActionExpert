@@ -1,0 +1,17 @@
+data:
+  dataset: ../../pushenv/training_data/lerobot/pusht
+  env_name: pusht
+obsencoder:
+  input_mode: partial_obs
+  name: resnet
+  freeze_backbone: false
+policy:
+  name: flowmatching
+  flowmatching:
+    network: mlp
+training:
+  output_dir: ../outputs/pusht/resnet_run01
+  batch_size: 32
+  val_ratio: 0.1
+  device: cuda
+  amp: true

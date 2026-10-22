@@ -5,10 +5,10 @@ from dataclasses import replace
 import torch
 from torch import nn
 
-from .encoder import EncoderConfig, VisualObservationEncoder
+from .encoder import EncoderConfig, PartialObservationEncoder
 
 
-class QwenObservationEncoder(VisualObservationEncoder):
+class QwenObservationEncoder(PartialObservationEncoder):
     """Qwen3-VL visual tower only; no tokenizer, language model or generation."""
 
     def __init__(self, obs_min, obs_max, config: EncoderConfig, *, pretrained=True):
@@ -42,8 +42,8 @@ class QwenObservationEncoder(VisualObservationEncoder):
             vision_config._attn_implementation = "sdpa"
             self.backbone = Qwen3VLVisionModel(vision_config).float()
         self.backbone.requires_grad_(not config.freeze_backbone)
-        self.projection = nn.Sequential(nn.Linear(vision_config.out_hidden_size, self.image_feature_dim),
-                                        nn.LayerNorm(self.image_feature_dim))
+        self.projection = nn.Sequential(nn.Linear(vision_config.out_hidden_size, self.output_dim),
+                                        nn.LayerNorm(self.output_dim))
         # Qwen3-VL's official pixel normalization differs from Qwen2-VL's defaults.
         self.image_processor = Qwen2VLImageProcessor(
             patch_size=vision_config.patch_size, temporal_patch_size=vision_config.temporal_patch_size,

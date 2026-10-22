@@ -1,4 +1,4 @@
-"""Train a keypoint- or RGB-conditioned FM policy from LeRobotDataset v3."""
+"""Train an FM policy with structured_state or partial_obs from LeRobotDataset v3."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import random
 import sys
 import time
 from itertools import chain
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -19,19 +19,20 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from learn.dataset import SequenceDataset, load_dataset, load_video_frames, split_episode_masks
+from learn.experiment import read_experiment, apply_experiment_defaults, experiment_snapshot, save_experiment
 from obsencoder.encoder import EncoderConfig, create_obsencoder
-from interact.act_standardizer import ActionStandardizer
-from policy.policy import PolicyConfig, create_policy, load_checkpoint, save_checkpoint
+from interact.action_execution import ActionStandardizer
+from policy.policy import PolicyConfig, create_policy, get_policy_backend, load_checkpoint, save_checkpoint
 
 
 def batch_loss(policy, encoder, standardizer, batch):
     observations = batch["obs"]
     if isinstance(observations, dict):
-        observations = {key: value[:, :policy.config.n_obs_steps].to(policy.device)
+        observations = {key: value[:, :policy.config.obs_horizon].to(policy.device)
                         for key, value in observations.items()
-                        if not (encoder.config.visual_only and key == "state")}
+                        if encoder.config.input_mode != "partial_obs" or key == "image"}
     else:
-        observations = observations.to(policy.device, dtype=torch.float32)[:, :policy.config.n_obs_steps]
+        observations = observations.to(policy.device, dtype=torch.float32)[:, :policy.config.obs_horizon]
     actions = batch["action"].to(policy.device, dtype=torch.float32)
     return policy.compute_loss(encoder(observations), standardizer.normalize(actions))
 
@@ -64,16 +65,26 @@ def validation_loss(policy, encoder, standardizer, loader, max_batches=20):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    selector = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    selector.add_argument("--config", type=Path, help="Experiment YAML; omitted settings keep their defaults.")
+    selector.add_argument("--policy-name", choices=["flowmatching"])
+    selected, _ = selector.parse_known_args()
+    try:
+        document = read_experiment(selected.config)
+        policy_name = selected.policy_name or document.get("policy", {}).get("name", "flowmatching")
+        backend = get_policy_backend(policy_name)
+    except (OSError, ValueError) as error:
+        selector.error(str(error))
+    parser = argparse.ArgumentParser(description=__doc__, parents=[selector], allow_abbrev=False)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--contract", type=Path, help="Explicit contract for datasets without physical semantics metadata.")
     parser.add_argument("--env-name", help="Check dataset environment name when provided.")
-    parser.add_argument("--policy-name", choices=["flowmatching"], default="flowmatching")
     parser.add_argument("--obsencoder-name", choices=["identity", "mlp", "resnet", "qwen"], default="identity")
     parser.add_argument("--encoder-output-dim", type=int)
     parser.add_argument("--encoder-hidden-dim", type=int, default=128)
     parser.add_argument("--image-key", default="observation.images.front")
-    parser.add_argument("--visual-only", action="store_true", help="Condition only on the selected RGB camera, without state features.")
+    parser.add_argument("--input-mode", choices=["structured_state", "partial_obs"], default="structured_state",
+                        help="structured_state: numeric state; partial_obs: selected RGB camera.")
     parser.add_argument("--video-width", type=int, help="Resize decoded RGB with INTER_AREA while preserving aspect ratio.")
     parser.add_argument("--sample-phase", type=int, help="Train only windows whose first executed action has this observation.phase (not a policy input).")
     parser.add_argument("--image-size", type=int, default=224, help="Backbone input resolution; raw camera dimensions come from the dataset.")
@@ -92,14 +103,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-episodes", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision for visual training.")
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=4)
-    parser.add_argument("--sample-steps", type=int, default=40)
-    parser.add_argument("--horizon", type=int, default=16)
-    parser.add_argument("--n-obs-steps", "--obs-horizon", type=int, default=2)
-    parser.add_argument("--n-action-steps", "--act-horizon", type=int, default=8)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False, help="Use CUDA mixed precision for visual training.")
+    parser.add_argument("--action-horizon", type=int, default=16, help="Number of generated actions, starting at the current observation.")
+    parser.add_argument("--obs-horizon", type=int, default=2, help="Number of observation history frames.")
     parser.add_argument("--expected-env", default="actionexpert")
+    backend.add_arguments(parser)
+    try:
+        apply_experiment_defaults(parser, document, selected.config, policy_name, backend.yaml_arguments())
+    except ValueError as error:
+        parser.error(str(error))
+    parser.set_defaults(policy_name=policy_name)
     return parser.parse_args()
 
 
@@ -112,12 +125,16 @@ def main() -> None:
     if min(
         args.train_steps,
         args.batch_size,
-        args.hidden_dim,
-        args.depth,
-        args.sample_steps,
         args.checkpoint_every,
     ) < 1:
         raise ValueError("Step, batch, episode and model sizes must be positive.")
+
+    policy_options = get_policy_backend(args.policy_name).config_from_args(args)
+    encoder_config = EncoderConfig(
+        name=args.obsencoder_name, output_dim=args.encoder_output_dim, hidden_dim=args.encoder_hidden_dim,
+        input_mode=args.input_mode, image_key=args.image_key, image_size=args.image_size,
+        freeze_backbone=args.freeze_backbone, model_name=args.qwen_model,
+    )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -133,31 +150,19 @@ def main() -> None:
     config = PolicyConfig(
         obs_dim=contract["obs_dim"],
         action_dim=contract["action_dim"],
-        horizon=args.horizon,
-        n_obs_steps=args.n_obs_steps,
-        n_action_steps=args.n_action_steps,
-        hidden_dim=args.hidden_dim,
-        depth=args.depth,
-        sample_steps=args.sample_steps,
+        action_horizon=args.action_horizon,
+        obs_horizon=args.obs_horizon,
     )
+    resume_payload = load_checkpoint(args.resume, device) if args.resume is not None else None
     train_mask, val_mask = split_episode_masks(
         len(episode_ends), args.val_ratio, args.seed, args.max_train_episodes
     )
     images = None
-    visual = args.obsencoder_name in {"resnet", "qwen"}
-    if args.visual_only and not visual:
-        raise ValueError("--visual-only requires resnet or qwen.")
-    encoder_options = {}
-    if visual:
-        names = contract.get("observation_names", [])
-        if not args.visual_only and not {"agent.x", "agent.y"}.issubset(names):
-            raise ValueError("RGB + agent XY requires named observation channels agent.x and agent.y.")
+    partial_obs = encoder_config.input_mode == "partial_obs"
+    if partial_obs:
         print(f"Decoding {args.image_key} width={args.video_width or 'native'}", flush=True)
         images = load_video_frames(args.dataset, args.image_key, width=args.video_width)
-        encoder_options = {"agent_indices": None if args.visual_only else (names.index("agent.x"), names.index("agent.y")),
-                           "image_shape": tuple(images.shape[1:]), "image_key": args.image_key,
-                           "image_size": args.image_size, "freeze_backbone": args.freeze_backbone,
-                           "model_name": args.qwen_model, "visual_only": args.visual_only}
+        encoder_config = replace(encoder_config, image_shape=tuple(images.shape[1:]))
     sample_mask = None
     if args.sample_phase is not None:
         import pyarrow.parquet as pq
@@ -167,21 +172,21 @@ def main() -> None:
         phases = np.concatenate([record["observation.phase"] for record in records]).reshape(-1)
         sample_mask = phases[np.argsort(indices)] == args.sample_phase
     train_dataset = SequenceDataset(
-        observations, actions, episode_ends, config, train_mask, images=images, sample_mask=sample_mask
+        observations, actions, episode_ends, config, train_mask, images=images, sample_mask=sample_mask,
     )
     val_dataset = SequenceDataset(
-        observations, actions, episode_ends, config, val_mask, images=images, sample_mask=sample_mask
+        observations, actions, episode_ends, config, val_mask, images=images, sample_mask=sample_mask,
     )
     train_rows = train_dataset.selected_rows()
-    encoder_config = EncoderConfig(args.obsencoder_name, args.encoder_output_dim, args.encoder_hidden_dim, **encoder_options)
     train_obs, train_actions = observations[train_rows], actions[train_rows]
     encoder = create_obsencoder(train_obs.min(0), train_obs.max(0), encoder_config, pretrained=args.pretrained and args.resume is None).to(device)
     encoder_config = encoder.config
+    print(f"POLICY_INPUT mode={encoder_config.input_mode} "
+          f"camera={encoder_config.image_key if partial_obs else 'none'}", flush=True)
     standardizer = ActionStandardizer(train_actions.min(0), train_actions.max(0),
                                      contract["action_low"], contract["action_high"],
-                                     config.action_start, config.n_action_steps,
                                      contract.get("action_groups")).to(device)
-    policy = create_policy(args.policy_name, config, encoder.output_dim).to(device)
+    policy = create_policy(args.policy_name, config, encoder.output_dim, policy_options=policy_options).to(device)
 
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
@@ -200,8 +205,10 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     start_step, best_val, history, prior_elapsed_seconds = 0, float("inf"), [], 0.0
     if args.resume is not None:
-        payload = load_checkpoint(args.resume, device)
-        if payload["config"] != asdict(config) or EncoderConfig(**payload["encoder_config"]) != encoder_config or payload["contract"] != contract:
+        payload = resume_payload
+        if (payload["policy_name"] != args.policy_name or payload["config"] != asdict(config)
+                or payload["policy_options"] != asdict(policy_options)
+                or EncoderConfig(**payload["encoder_config"]) != encoder_config or payload["contract"] != contract):
             raise ValueError("Resume checkpoint configuration differs from this run.")
         policy.load_state_dict(payload["policy_state_dict"])
         encoder.load_state_dict(payload["obsencoder_state_dict"])
@@ -226,6 +233,23 @@ def main() -> None:
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.output_dir / "policy.pt"
+    experiment = experiment_snapshot(args, get_policy_backend(args.policy_name).yaml_arguments(), {
+        "device": str(device), "amp_enabled": scaler.is_enabled(),
+        "obsencoder": {**asdict(encoder_config), "input_dim": encoder.input_dim,
+                       "output_dim": encoder.output_dim},
+        "policy": {"name": args.policy_name, **asdict(config), "condition_dim": encoder.output_dim,
+                   "options": asdict(policy_options)},
+        "dataset": {"action_alignment": "current", "pad_before": config.obs_horizon - 1, "pad_after": train_dataset.pad_after,
+                    "training_episode_indices": np.flatnonzero(train_mask).tolist(),
+                    "validation_episode_indices": np.flatnonzero(val_mask).tolist(),
+                    "train_windows": len(train_dataset), "validation_windows": len(val_dataset)},
+        "optimizer": {"name": type(optimizer).__name__, "parameter_groups": [
+            {key: value for key, value in group.items() if key != "params"} for group in optimizer.param_groups]},
+        "training": {"start_step": start_step, "gradient_clip_norm": 1.0, "validation_max_batches": 20,
+                     "log_every": 100, "num_workers": 0, "drop_last": False, "torch_num_threads": 1},
+        "contract": contract,
+    })
+    save_experiment(args.output_dir / "experiment.yaml", experiment)
     start_time = time.monotonic()
 
     def save(step, val_loss):
@@ -239,24 +263,25 @@ def main() -> None:
             "training_episode_indices": np.flatnonzero(train_mask).tolist(),
             "validation_episode_indices": np.flatnonzero(val_mask).tolist(),
             "train_windows": len(train_dataset), "validation_windows": len(val_dataset),
-            "pad_before": config.n_obs_steps - 1, "pad_after": config.n_action_steps - 1,
+            "pad_before": config.obs_horizon - 1, "pad_after": train_dataset.pad_after,
             "batch_size": args.batch_size, "learning_rate": args.learning_rate,
             "train_steps": step, "target_steps": args.train_steps,
             "final_train_loss": latest_loss, "validation_flow_loss": val_loss,
             "best_validation_flow_loss": best_val, "loss_history": history,
             "sample_phase": args.sample_phase, "video_width": args.video_width,
-            "visual_only": args.visual_only, "amp": args.amp,
+            "input_mode": args.input_mode, "amp": args.amp,
             "elapsed_seconds": prior_elapsed_seconds + time.monotonic() - start_time,
         }
-        payload = {"config": asdict(config), "policy_name": args.policy_name, "contract": contract,
+        payload = {"config": asdict(config), "policy_name": args.policy_name, "policy_options": asdict(policy_options), "contract": contract,
                    "encoder_config": asdict(encoder_config), "policy_state_dict": policy.state_dict(),
                    "obsencoder_state_dict": encoder.state_dict(), "action_standardizer_state_dict": standardizer.state_dict(),
                    "optimizer_state_dict": optimizer.state_dict(),
-                   "grad_scaler_state_dict": scaler.state_dict(), "metadata": metadata}
+                   "grad_scaler_state_dict": scaler.state_dict(), "metadata": metadata,
+                   "experiment": experiment}
         save_checkpoint(checkpoint_path, payload)
         if improved:
             save_checkpoint(args.output_dir / "best.pt", payload)
-        report = {"policy_name": args.policy_name, "config": asdict(config),
+        report = {"policy_name": args.policy_name, "config": asdict(config), "policy_options": asdict(policy_options),
                   "encoder_config": asdict(encoder_config), "contract": contract, "training": metadata}
         (args.output_dir / "metrics.json").write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
         print(f"step={step:06d} validation_flow_loss={val_loss:.6f} best={best_val:.6f} saved={checkpoint_path.resolve()}", flush=True)

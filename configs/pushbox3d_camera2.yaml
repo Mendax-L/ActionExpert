@@ -1,0 +1,27 @@
+data:
+  dataset: ../../pushenv/training_data/lerobot/pushbox3d/scripted-straight-yaw-cw-waist-camera2-20261020-144758
+  env_name: pushbox3d
+  video_width: 256
+  sample_phase: 1
+obsencoder:
+  input_mode: partial_obs
+  name: resnet
+  output_dim: 256
+  image_key: observation.images.camera2
+  image_size: 224
+  freeze_backbone: false
+policy:
+  name: flowmatching
+  obs_horizon: 2
+  action_horizon: 16
+  flowmatching:
+    network: mlp
+training:
+  output_dir: ../outputs/pushbox3d/camera2_yaw_cw_run01
+  train_steps: 3000
+  checkpoint_every: 1000
+  batch_size: 32
+  learning_rate: 1.0e-4
+  val_ratio: 0.1
+  device: cuda
+  amp: true

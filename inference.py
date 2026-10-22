@@ -12,28 +12,24 @@ import threading
 import numpy as np
 import torch
 
-from interact.env_protocol import PROTOCOL_VERSION, PolicyServer, unpack_image, validate_contract
-from interact.act_standardizer import ActionStandardizer
+from interact.env_protocol import PROTOCOL_VERSION, PolicyServer, unpack_image, validate_contract, interaction_output
+from interact.action_execution import ActionExecution, ActionStandardizer
 from interact.obs_pool import ObsPool
-from obsencoder.encoder import EncoderConfig, VisualObservationEncoder, create_obsencoder
+from obsencoder.encoder import EncoderConfig, create_obsencoder
 from policy.policy import PolicyConfig, create_policy, load_checkpoint
 
 
 class PolicySession:
     """Per-client history and sampler RNG; reset never touches remote physics."""
 
-    def __init__(self, policy, encoder, standardizer, contract, seed=100_000):
+    def __init__(self, policy, encoder, standardizer, contract, seed=100_000, execution=None):
         self.policy = policy
         self.encoder, self.standardizer = encoder, standardizer
+        self.execution = execution if execution is not None else ActionExecution.for_horizon(policy.config.action_horizon)
+        self.execution.validate(policy.config.action_horizon)
         self.contract = validate_contract(contract)
-        if isinstance(encoder, VisualObservationEncoder) and not encoder.config.visual_only:
-            names = self.contract.get("observation_names", [])
-            if not {"agent.x", "agent.y"}.issubset(names) or tuple(encoder.config.agent_indices) != (
-                names.index("agent.x"), names.index("agent.y")
-            ):
-                raise ValueError("Visual encoder agent XY channels disagree with the environment contract.")
-        image_shape = encoder.config.image_shape if isinstance(encoder, VisualObservationEncoder) else None
-        self.pool = ObsPool(policy.config.n_obs_steps, policy.config.obs_dim, image_shape, encoder.config.image_key)
+        image_shape = encoder.config.image_shape if encoder.config.input_mode == "partial_obs" else None
+        self.pool = ObsPool(policy.config.obs_horizon, policy.config.obs_dim, image_shape, encoder.config.image_key)
         self.generator = torch.Generator(device=policy.device).manual_seed(seed)
 
     def __call__(self, request):
@@ -46,13 +42,15 @@ class PolicySession:
                     "env": Path(sys.prefix).name, "executable": sys.executable,
                     "environment": self.contract.get("environment"),
                     "policy_name": "flowmatching", "obsencoder_name": self.encoder.config.name,
+                    "input_mode": self.encoder.config.input_mode,
                     "training_steps": getattr(self, "training_metadata", {}).get("train_steps"),
-                    "obs_shape": [self.policy.config.n_obs_steps, self.policy.config.obs_dim],
-                    "action_shape": [self.standardizer.act_horizon, self.policy.config.action_dim],
+                    "checkpoint": getattr(self, "checkpoint_path", None),
+                    "obs_shape": [self.policy.config.obs_horizon, self.policy.config.obs_dim],
+                    "action_shape": [self.execution.execute_steps, self.policy.config.action_dim],
+                    "action_horizon": self.policy.config.action_horizon,
                     "contract": self.contract}
             if self.pool.image_shape is not None:
-                result.update(image_shape=list(self.pool.image_shape), image_key=self.pool.image_key,
-                              visual_only=self.encoder.config.visual_only)
+                result.update(image_shape=list(self.pool.image_shape), image_key=self.pool.image_key)
             return result
         if operation == "reset":
             seed = request.get("seed")
@@ -74,25 +72,23 @@ class PolicySession:
                         image = image[0]
                 value = value["observation.state"]
             observations = np.asarray(value, dtype=np.float32)
-            if self.encoder.config.visual_only:
+            if self.encoder.config.input_mode == "partial_obs":
                 observations = np.zeros_like(observations)
             value = {"state": observations, "image": image} if self.pool.image_shape is not None else observations
             if observations.ndim == 1:
                 self.pool.append(value)
             else:
                 self.pool.replace(value)
-            noise = torch.randn((1, self.policy.config.horizon, self.policy.config.action_dim),
+            noise = torch.randn((1, self.policy.config.action_horizon, self.policy.config.action_dim),
                                 generator=self.generator, device=self.policy.device)
             with torch.no_grad():
                 value = self.pool.observation()
                 if isinstance(value, dict):
                     history = {"image": torch.as_tensor(value["image"].transpose(0, 3, 1, 2)[None].copy(), device=self.policy.device)}
-                    if not self.encoder.config.visual_only:
-                        history["state"] = torch.as_tensor(value["state"][None], device=self.policy.device)
                 else:
                     history = torch.as_tensor(value[None], device=self.policy.device)
                 prediction = self.policy.sample(self.encoder(history), noise=noise)
-                action = self.standardizer(prediction)["action"][0]
+                action = self.execution(self.standardizer(prediction))[0]
             response = {"ok": True, "action": action.cpu().tolist()}
             groups = self.standardizer.split(action)
             if groups:
@@ -103,14 +99,11 @@ class PolicySession:
         raise ValueError(f"Unknown operation: {operation!r}.")
 
 
-def load_session(path, device="cpu", *, obsencoder_checkpoint=None, seed=100_000, act_horizon=None):
+def load_session(path, device="cpu", *, obsencoder_checkpoint=None, seed=100_000, execute_steps=None):
     """The inference entry point composes independent modules from checkpoint data."""
     payload = load_checkpoint(path, device)
     config = PolicyConfig(**payload["config"])
-    if act_horizon is None:
-        act_horizon = config.n_action_steps
-    if type(act_horizon) is not int or not 1 <= act_horizon <= config.n_action_steps:
-        raise ValueError(f"act-horizon must be between 1 and the trained value {config.n_action_steps}.")
+    execution = ActionExecution.for_horizon(config.action_horizon, execute_steps)
     contract = validate_contract(payload["contract"])
     if (config.obs_dim, config.action_dim) != (contract["obs_dim"], contract["action_dim"]):
         raise ValueError("Checkpoint config and contract dimensions differ.")
@@ -135,16 +128,18 @@ def load_session(path, device="cpu", *, obsencoder_checkpoint=None, seed=100_000
     action_state = payload["action_standardizer_state_dict"]
     standardizer = ActionStandardizer(action_state["action_min"], action_state["action_max"],
                                      contract["action_low"], contract["action_high"],
-                                     config.action_start, act_horizon, contract.get("action_groups")).to(device)
+                                     contract.get("action_groups")).to(device)
     for key, field in (("low", "action_low"), ("high", "action_high")):
         if not torch.equal(action_state[key].cpu(), torch.tensor(contract[field], dtype=torch.float32)):
             raise ValueError("Checkpoint action bounds disagree with contract.")
     standardizer.load_state_dict(action_state)
-    policy = create_policy(payload["policy_name"], config, encoder.output_dim).to(device)
+    policy = create_policy(payload["policy_name"], config, encoder.output_dim,
+                           policy_options=payload["policy_options"]).to(device)
     policy.load_state_dict(payload["policy_state_dict"])
     policy.eval()
-    session = PolicySession(policy, encoder, standardizer, contract, seed)
+    session = PolicySession(policy, encoder, standardizer, contract, seed, execution)
     session.training_metadata = payload.get("metadata", {})
+    session.checkpoint_path = str(Path(path).resolve())
     return session
 
 
@@ -157,7 +152,8 @@ def parse_args():
     parser.add_argument("--obsencoder-checkpoint", type=Path)
     parser.add_argument("--policy-name", choices=["flowmatching"])
     parser.add_argument("--obs-horizon", type=int, help="Assert observation history matches checkpoint.")
-    parser.add_argument("--act-horizon", type=int, help="Execute this many actions before replanning; at most the checkpoint value.")
+    parser.add_argument("--action-horizon", type=int, help="Assert prediction length matches checkpoint.")
+    parser.add_argument("--execute-steps", type=int, help="Actions executed before replanning; selected by interact (default: up to 8).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765, help="0 selects an available port.")
     parser.add_argument("--socket-timeout", type=float, default=120.0)
@@ -169,7 +165,7 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--seed", type=int, default=100_000)
     parser.add_argument("--max-steps", type=int, default=300)
-    parser.add_argument("--output", type=Path, default=Path("outputs/inference/metrics.json"))
+    parser.add_argument("--output", type=Path, help="Report inside the checkpoint's training directory; default: inference/<timestamp>/metrics.json.")
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--show", action="store_true", help="Show a live environment preview during rollout.")
     return parser.parse_args()
@@ -186,23 +182,28 @@ def main():
     torch.set_num_threads(1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else torch.device(args.device)
     session = load_session(args.checkpoint, device, obsencoder_checkpoint=args.obsencoder_checkpoint,
-                           seed=args.seed, act_horizon=args.act_horizon)
+                           seed=args.seed, execute_steps=args.execute_steps)
     policy = session.policy
     if args.obsencoder_name is not None and args.obsencoder_name != session.encoder.config.name:
         raise ValueError("Requested obsencoder-name differs from checkpoint.")
-    if args.obs_horizon is not None and args.obs_horizon != policy.config.n_obs_steps:
-        raise ValueError(f"obs-horizon={args.obs_horizon} differs from checkpoint value {policy.config.n_obs_steps}.")
+    if args.obs_horizon is not None and args.obs_horizon != policy.config.obs_horizon:
+        raise ValueError(f"obs-horizon={args.obs_horizon} differs from checkpoint value {policy.config.obs_horizon}.")
+    if args.action_horizon is not None and args.action_horizon != policy.config.action_horizon:
+        raise ValueError(f"action-horizon={args.action_horizon} differs from checkpoint value {policy.config.action_horizon}.")
     if args.env_name is not None and session.contract.get("environment", args.env_name) != args.env_name:
         raise ValueError("env-name differs from checkpoint environment.")
     mode = args.mode or ("rollout" if args.env_name else "serve")
     name = args.env_name or session.contract.get("environment")
     if mode == "rollout":
+        args.output = interaction_output(args.checkpoint, args.output)
         if name not in {"pusht", "pushbox2d", "pushbox3d"}:
             raise ValueError("Rollout requires --env-name or a named environment in the checkpoint.")
         if not args.env_python.is_file() or not (args.pushenv_root / "environment.py").is_file():
             raise FileNotFoundError("Cannot locate pushenv; set --env-python and --pushenv-root.")
     with PolicyServer(session, args.host, args.port, args.socket_timeout) as server:
         print(f"MODEL_READY {args.host}:{server.port} env={Path(sys.prefix).name} device={policy.device}", flush=True)
+        print(f"POLICY_INPUT mode={session.encoder.config.input_mode} "
+              f"camera={session.pool.image_key if session.pool.image_shape is not None else 'none'}", flush=True)
         if mode == "serve":
             server.serve()
             return
