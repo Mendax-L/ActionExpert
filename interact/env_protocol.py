@@ -1,7 +1,7 @@
-"""TCP framing, interface contracts and the isolated pushenv client process.
+"""TCP framing, interface contracts and the isolated ReposeEnv client process.
 
 Importing this module uses only the standard library. Simulator imports happen
-only when this file is executed by the pushenv interpreter.
+only when this file is executed by the ReposeEnv interpreter.
 """
 
 from __future__ import annotations
@@ -289,7 +289,7 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
         if tuple(image_shape) != source_image_shape:
             import cv2
     pool = ObsPool(obs_shape[0], environment.obs_dim, image_shape, image_key)
-    spatial = environment.name == "pushbox3d"
+    spatial = environment.name == "alignbox3d"
     input_mode = health.get("input_mode")
     if input_mode not in {"structured_state", "partial_obs"}:
         raise ValueError("Policy input_mode must be structured_state or partial_obs.")
@@ -478,8 +478,8 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pushenv-root", type=Path, required=True)
-    parser.add_argument("--env-name", choices=["pusht", "pushbox2d", "pushbox3d"], required=True)
+    parser.add_argument("--reposeenv-root", "--pushenv-root", dest="reposeenv_root", type=Path, required=True)
+    parser.add_argument("--env-name", choices=["pusht", "pushbox2d", "alignbox3d"], required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--episodes", type=int, default=1)
@@ -493,11 +493,11 @@ def main():
     if min(args.episodes, args.max_steps) < 1:
         raise ValueError("episodes and max-steps must be positive.")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    sys.path.insert(0, str(args.pushenv_root.resolve()))
+    sys.path.insert(0, str(args.reposeenv_root.resolve()))
     from environment import make_environment
     from policy_interface import assert_environment_runtime, connect_with_retry
 
-    assert_environment_runtime("pushenv")
+    assert_environment_runtime("ReposeEnv")
     with connect_with_retry(args.host, args.port, 30.0) as connection:
         connection.settimeout(args.socket_timeout)
         try:

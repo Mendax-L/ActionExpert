@@ -1,0 +1,31 @@
+data:
+  dataset: ../../ReposeEnv/training_data/lerobot/alignbox3d/grasp-carry
+  env_name: alignbox3d
+  video_width: 128
+  instruction: 抓取上箱，抬起并对齐下箱，然后放下并松开夹爪。
+obsencoder:
+  name: qwen_vlm
+  input_mode: multimodal
+  model_name: Qwen/Qwen3-VL-2B-Instruct
+  image_key: observation.images.camera2
+  image_size: 224
+  output_dim: 256
+  hidden_dim: 128
+  freeze_backbone: true
+  # Actual feedback only, inner then outer:
+  # XYZ (3) + quaternion WXYZ (4) + measured gripper travel (1) per arm.
+  state_indices: [37, 38, 39, 58, 59, 60, 61, 54,
+                  40, 41, 42, 62, 63, 64, 65, 55]
+policy:
+  name: flowmatching
+  obs_horizon: 2
+  action_horizon: 16
+  flowmatching:
+    network: mlp
+training:
+  output_dir: ../outputs/alignbox3d/qwen_vlm_run01
+  batch_size: 1
+  train_steps: 3000
+  checkpoint_every: 1000
+  device: cuda
+  amp: true

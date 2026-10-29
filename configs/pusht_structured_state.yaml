@@ -1,6 +1,6 @@
 # Unspecified options use the training/backend defaults.
 data:
-  dataset: ../../pushenv/training_data/lerobot/pusht
+  dataset: ../../ReposeEnv/training_data/lerobot/pusht
   env_name: pusht
 obsencoder:
   input_mode: structured_state

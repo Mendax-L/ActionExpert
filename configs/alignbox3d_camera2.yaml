@@ -1,6 +1,6 @@
 data:
-  dataset: ../../pushenv/training_data/lerobot/pushbox3d/scripted-straight-yaw-cw-waist-camera2-20261020-144758
-  env_name: pushbox3d
+  dataset: ../../ReposeEnv/training_data/lerobot/alignbox3d/scripted-straight-yaw-cw-waist-camera2-20261020-144758
+  env_name: alignbox3d
   video_width: 256
   sample_phase: 1
 obsencoder:
@@ -17,7 +17,7 @@ policy:
   flowmatching:
     network: mlp
 training:
-  output_dir: ../outputs/pushbox3d/camera2_yaw_cw_run01
+  output_dir: ../outputs/alignbox3d/camera2_yaw_cw_run01
   train_steps: 3000
   checkpoint_every: 1000
   batch_size: 32

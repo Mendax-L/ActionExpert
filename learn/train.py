@@ -13,28 +13,46 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from learn.dataset import SequenceDataset, load_dataset, load_video_frames, split_episode_masks
+from learn.dataset import (SequenceDataset, load_dataset, load_episode_groups,
+                           load_language_features, load_instructions, load_video_frames, split_episode_masks)
 from learn.experiment import read_experiment, apply_experiment_defaults, experiment_snapshot, save_experiment
 from obsencoder.encoder import EncoderConfig, create_obsencoder
 from interact.action_execution import ActionStandardizer
 from policy.policy import PolicyConfig, create_policy, get_policy_backend, load_checkpoint, save_checkpoint
 
 
+def collate_batch(samples):
+    batch = default_collate(samples)
+    if isinstance(samples[0]["obs"], dict) and "instruction" in samples[0]["obs"]:
+        batch["obs"]["instruction"] = [sample["obs"]["instruction"] for sample in samples]
+    return batch
+
+
 def batch_loss(policy, encoder, standardizer, batch):
     observations = batch["obs"]
+    language = observations.get("language") if isinstance(observations, dict) else None
     if isinstance(observations, dict):
-        observations = {key: value[:, :policy.config.obs_horizon].to(policy.device)
-                        for key, value in observations.items()
-                        if encoder.config.input_mode != "partial_obs" or key == "image"}
+        if encoder.config.input_mode in {"partial_obs", "multimodal"}:
+            source = observations
+            observations = {"image": observations["image"][:, :policy.config.obs_horizon].to(policy.device)}
+            if encoder.config.input_mode == "multimodal":
+                observations.update(state=source["state"][:, :policy.config.obs_horizon].to(policy.device),
+                                    instruction=source["instruction"])
+        else:
+            observations = observations["state"].to(policy.device, dtype=torch.float32)[:, :policy.config.obs_horizon]
     else:
         observations = observations.to(policy.device, dtype=torch.float32)[:, :policy.config.obs_horizon]
     actions = batch["action"].to(policy.device, dtype=torch.float32)
-    return policy.compute_loss(encoder(observations), standardizer.normalize(actions))
+    condition = encoder(observations)
+    if language is not None:
+        language = language[:, :policy.config.obs_horizon].to(policy.device, dtype=torch.float32)
+        condition = torch.cat((condition, language), dim=-1)
+    return policy.compute_loss(condition, standardizer.normalize(actions))
 
 
 @torch.no_grad()
@@ -79,16 +97,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--contract", type=Path, help="Explicit contract for datasets without physical semantics metadata.")
     parser.add_argument("--env-name", help="Check dataset environment name when provided.")
-    parser.add_argument("--obsencoder-name", choices=["identity", "mlp", "resnet", "qwen"], default="identity")
+    parser.add_argument("--obsencoder-name", choices=["identity", "mlp", "resnet", "qwen", "qwen_vlm"], default="qwen_vlm")
     parser.add_argument("--encoder-output-dim", type=int)
     parser.add_argument("--encoder-hidden-dim", type=int, default=128)
     parser.add_argument("--image-key", default="observation.images.front")
-    parser.add_argument("--input-mode", choices=["structured_state", "partial_obs"], default="structured_state",
+    parser.add_argument("--input-mode", choices=["structured_state", "partial_obs", "multimodal"], default="multimodal",
                         help="structured_state: numeric state; partial_obs: selected RGB camera.")
     parser.add_argument("--video-width", type=int, help="Resize decoded RGB with INTER_AREA while preserving aspect ratio.")
     parser.add_argument("--sample-phase", type=int, help="Train only windows whose first executed action has this observation.phase (not a policy input).")
+    parser.add_argument("--language-style", choices=["none", "direction", "graded", "numeric", "all"],
+                        default="none", help="Optional 12-D atomic-language condition and ablation style.")
     parser.add_argument("--image-size", type=int, default=224, help="Backbone input resolution; raw camera dimensions come from the dataset.")
     parser.add_argument("--qwen-model", default="Qwen/Qwen3-VL-2B-Instruct", help="Hugging Face model id or local Qwen3-VL directory.")
+    parser.add_argument("--state-indices", type=int, nargs="+", help="Robot channels selected from observation.state; default: all supplied channels.")
+    parser.add_argument("--instruction", help="Fixed natural-language task; default: resolve each frame's LeRobot task_index.")
     parser.add_argument("--freeze-backbone", action=argparse.BooleanOptionalAction, default=None,
                         help="Default: train ResNet backbone; freeze Qwen backbone.")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True,
@@ -97,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-steps", type=int, default=20_000)
     parser.add_argument("--resume", type=Path, help="Resume model and optimizer; train-steps is the total target step count.")
     parser.add_argument("--checkpoint-every", type=int, default=2000)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--val-ratio", type=float, default=0.02)
     parser.add_argument("--max-train-episodes", type=int)
@@ -113,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     except ValueError as error:
         parser.error(str(error))
     parser.set_defaults(policy_name=policy_name)
+    # Existing explicit encoder selections keep their established input modes.
+    if not any(value == "--input-mode" or value.startswith("--input-mode=") for value in sys.argv[1:]) and "input_mode" not in document.get("obsencoder", {}):
+        encoder_name = parser.parse_args().obsencoder_name
+        parser.set_defaults(input_mode="multimodal" if encoder_name == "qwen_vlm" else
+                            "partial_obs" if encoder_name in {"resnet", "qwen"} else "structured_state")
     return parser.parse_args()
 
 
@@ -134,6 +161,7 @@ def main() -> None:
         name=args.obsencoder_name, output_dim=args.encoder_output_dim, hidden_dim=args.encoder_hidden_dim,
         input_mode=args.input_mode, image_key=args.image_key, image_size=args.image_size,
         freeze_backbone=args.freeze_backbone, model_name=args.qwen_model,
+        state_indices=args.state_indices,
     )
 
     random.seed(args.seed)
@@ -154,11 +182,14 @@ def main() -> None:
         obs_horizon=args.obs_horizon,
     )
     resume_payload = load_checkpoint(args.resume, device) if args.resume is not None else None
+    episode_groups = load_episode_groups(args.dataset)
     train_mask, val_mask = split_episode_masks(
-        len(episode_ends), args.val_ratio, args.seed, args.max_train_episodes
+        len(episode_ends), args.val_ratio, args.seed, args.max_train_episodes, groups=episode_groups
     )
     images = None
-    partial_obs = encoder_config.input_mode == "partial_obs"
+    language = load_language_features(args.dataset, args.language_style)
+    partial_obs = encoder_config.input_mode in {"partial_obs", "multimodal"}
+    instructions = load_instructions(args.dataset, args.instruction) if encoder_config.input_mode == "multimodal" else None
     if partial_obs:
         print(f"Decoding {args.image_key} width={args.video_width or 'native'}", flush=True)
         images = load_video_frames(args.dataset, args.image_key, width=args.video_width)
@@ -172,13 +203,19 @@ def main() -> None:
         phases = np.concatenate([record["observation.phase"] for record in records]).reshape(-1)
         sample_mask = phases[np.argsort(indices)] == args.sample_phase
     train_dataset = SequenceDataset(
-        observations, actions, episode_ends, config, train_mask, images=images, sample_mask=sample_mask,
+        observations, actions, episode_ends, config, train_mask, images=images, language=language, instructions=instructions,
+        sample_mask=sample_mask,
     )
     val_dataset = SequenceDataset(
-        observations, actions, episode_ends, config, val_mask, images=images, sample_mask=sample_mask,
+        observations, actions, episode_ends, config, val_mask, images=images, language=language, instructions=instructions,
+        sample_mask=sample_mask,
     )
     train_rows = train_dataset.selected_rows()
     train_obs, train_actions = observations[train_rows], actions[train_rows]
+    if resume_payload is not None and encoder_config.name == "qwen_vlm":
+        encoder_config = replace(encoder_config,
+            vlm_config=resume_payload["encoder_config"]["vlm_config"],
+            processor_config=resume_payload["encoder_config"]["processor_config"])
     encoder = create_obsencoder(train_obs.min(0), train_obs.max(0), encoder_config, pretrained=args.pretrained and args.resume is None).to(device)
     encoder_config = encoder.config
     print(f"POLICY_INPUT mode={encoder_config.input_mode} "
@@ -186,7 +223,14 @@ def main() -> None:
     standardizer = ActionStandardizer(train_actions.min(0), train_actions.max(0),
                                      contract["action_low"], contract["action_high"],
                                      contract.get("action_groups")).to(device)
-    policy = create_policy(args.policy_name, config, encoder.output_dim, policy_options=policy_options).to(device)
+    language_dim = 0 if language is None else language.shape[1]
+    language_condition = {
+        "style": args.language_style,
+        "dim": language_dim,
+        "layout": "primitive_onehot[6],magnitude_onehot[3],target_delta_normalized[3]",
+    }
+    policy = create_policy(args.policy_name, config, encoder.output_dim + language_dim,
+                           policy_options=policy_options).to(device)
 
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
@@ -196,9 +240,10 @@ def main() -> None:
         num_workers=0,
         drop_last=False,
         generator=generator,
+        collate_fn=collate_batch,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
+        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch
     )
     parameters = [parameter for parameter in chain(policy.parameters(), encoder.parameters()) if parameter.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, betas=(0.95, 0.999), weight_decay=1e-6)
@@ -206,9 +251,12 @@ def main() -> None:
     start_step, best_val, history, prior_elapsed_seconds = 0, float("inf"), [], 0.0
     if args.resume is not None:
         payload = resume_payload
+        saved_language = payload.get("language_condition", {"style": "none", "dim": 0})
         if (payload["policy_name"] != args.policy_name or payload["config"] != asdict(config)
                 or payload["policy_options"] != asdict(policy_options)
-                or EncoderConfig(**payload["encoder_config"]) != encoder_config or payload["contract"] != contract):
+                or EncoderConfig(**payload["encoder_config"]) != encoder_config or payload["contract"] != contract
+                or {key: saved_language.get(key) for key in ("style", "dim")}
+                != {key: language_condition[key] for key in ("style", "dim")}):
             raise ValueError("Resume checkpoint configuration differs from this run.")
         policy.load_state_dict(payload["policy_state_dict"])
         encoder.load_state_dict(payload["obsencoder_state_dict"])
@@ -237,9 +285,12 @@ def main() -> None:
         "device": str(device), "amp_enabled": scaler.is_enabled(),
         "obsencoder": {**asdict(encoder_config), "input_dim": encoder.input_dim,
                        "output_dim": encoder.output_dim},
-        "policy": {"name": args.policy_name, **asdict(config), "condition_dim": encoder.output_dim,
+        "policy": {"name": args.policy_name, **asdict(config), "condition_dim": encoder.output_dim + language_dim,
                    "options": asdict(policy_options)},
+        "language_condition": language_condition,
         "dataset": {"action_alignment": "current", "pad_before": config.obs_horizon - 1, "pad_after": train_dataset.pad_after,
+                    "split_group_field": "collection.pair_id" if episode_groups is not None else None,
+                    "episode_group_ids": episode_groups.tolist() if episode_groups is not None else None,
                     "training_episode_indices": np.flatnonzero(train_mask).tolist(),
                     "validation_episode_indices": np.flatnonzero(val_mask).tolist(),
                     "train_windows": len(train_dataset), "validation_windows": len(val_dataset)},
@@ -262,6 +313,8 @@ def main() -> None:
             "train_episodes": int(train_mask.sum()), "validation_episodes": int(val_mask.sum()),
             "training_episode_indices": np.flatnonzero(train_mask).tolist(),
             "validation_episode_indices": np.flatnonzero(val_mask).tolist(),
+            "split_group_field": "collection.pair_id" if episode_groups is not None else None,
+            "episode_group_ids": episode_groups.tolist() if episode_groups is not None else None,
             "train_windows": len(train_dataset), "validation_windows": len(val_dataset),
             "pad_before": config.obs_horizon - 1, "pad_after": train_dataset.pad_after,
             "batch_size": args.batch_size, "learning_rate": args.learning_rate,
@@ -269,10 +322,11 @@ def main() -> None:
             "final_train_loss": latest_loss, "validation_flow_loss": val_loss,
             "best_validation_flow_loss": best_val, "loss_history": history,
             "sample_phase": args.sample_phase, "video_width": args.video_width,
-            "input_mode": args.input_mode, "amp": args.amp,
+            "input_mode": args.input_mode, "language_style": args.language_style, "amp": args.amp,
             "elapsed_seconds": prior_elapsed_seconds + time.monotonic() - start_time,
         }
         payload = {"config": asdict(config), "policy_name": args.policy_name, "policy_options": asdict(policy_options), "contract": contract,
+                   "language_condition": language_condition,
                    "encoder_config": asdict(encoder_config), "policy_state_dict": policy.state_dict(),
                    "obsencoder_state_dict": encoder.state_dict(), "action_standardizer_state_dict": standardizer.state_dict(),
                    "optimizer_state_dict": optimizer.state_dict(),
@@ -282,7 +336,8 @@ def main() -> None:
         if improved:
             save_checkpoint(args.output_dir / "best.pt", payload)
         report = {"policy_name": args.policy_name, "config": asdict(config), "policy_options": asdict(policy_options),
-                  "encoder_config": asdict(encoder_config), "contract": contract, "training": metadata}
+                  "encoder_config": asdict(encoder_config), "language_condition": language_condition,
+                  "contract": contract, "training": metadata}
         (args.output_dir / "metrics.json").write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
         print(f"step={step:06d} validation_flow_loss={val_loss:.6f} best={best_val:.6f} saved={checkpoint_path.resolve()}", flush=True)
 

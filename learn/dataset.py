@@ -253,11 +253,111 @@ def load_video_frames(path: str | Path, image_key: str = "observation.images.fro
     return images
 
 
+def load_episode_groups(path: str | Path) -> np.ndarray | None:
+    """Read optional ablation pair IDs; legacy datasets keep their old split."""
+    import pyarrow.parquet as pq
+
+    root = Path(path)
+    files = sorted((root / "data").rglob("*.parquet"))
+    key = "collection.pair_id"
+    present = [key in pq.read_schema(file).names for file in files]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError("collection.pair_id must be present in every data file or none.")
+    pairs = {}
+    for file in files:
+        rows = pq.read_table(file, columns=["episode_index", key]).to_pydict()
+        for episode, pair in zip(rows["episode_index"], rows[key]):
+            if type(pair) is not int or pair < 0:
+                raise ValueError("collection.pair_id must be a nonnegative scalar integer.")
+            if episode in pairs and pairs[episode] != pair:
+                raise ValueError("collection.pair_id must stay constant within an episode.")
+            pairs[episode] = pair
+    episodes = [row for file in sorted((root / "meta/episodes").rglob("*.parquet"))
+                for row in pq.read_table(file, columns=["episode_index", "dataset_from_index"]).to_pylist()]
+    episodes.sort(key=lambda row: row["dataset_from_index"])
+    return np.asarray([pairs[row["episode_index"]] for row in episodes], dtype=np.int64)
+
+
+def load_instructions(path: str | Path, instruction: str | None = None) -> np.ndarray:
+    """Resolve LeRobot task_index into text, with optional fixed task instruction."""
+    import pyarrow.parquet as pq
+
+    root = Path(path)
+    total = _json(root / "meta/info.json")["total_frames"]
+    if instruction is not None:
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError("instruction must be nonempty natural-language text.")
+        return np.full(total, instruction, dtype=object)
+    tasks = pq.read_table(root / "meta/tasks.parquet").to_pylist()
+    mapping = {}
+    for row in tasks:
+        text = row.get("task", row.get("__index_level_0__"))
+        task_id = row.get("task_index")
+        if type(task_id) is not int or task_id in mapping or not isinstance(text, str) or not text.strip():
+            raise ValueError("tasks.parquet must map unique integer task_index values to nonempty task text.")
+        mapping[task_id] = text
+    records = [row for file in sorted((root / "data").rglob("*.parquet"))
+               for row in pq.read_table(file, columns=["index", "task_index"]).to_pylist()]
+    indices = [row["index"] for row in records]
+    if (any(type(index) is not int for index in indices) or sorted(indices) != list(range(total))
+            or any(type(row["task_index"]) is not int or row["task_index"] not in mapping for row in records)):
+        raise ValueError("Instruction indices must cover every frame once and refer to a known task.")
+    result = np.empty(total, dtype=object)
+    for row in records:
+        result[row["index"]] = mapping[row["task_index"]]
+    return result
+
+
+def load_language_features(path: str | Path, style: str = "none") -> np.ndarray | None:
+    """Load a fixed 12-D command condition for language ablations.
+
+    direction uses the six-way primitive identity, graded additionally exposes
+    the three-way magnitude word, and numeric exposes the signed SI target.
+    Keeping the width fixed makes checkpoints and ablations directly comparable.
+    """
+    if style == "none":
+        return None
+    if style not in {"direction", "graded", "numeric", "all"}:
+        raise ValueError("language style must be none, direction, graded, numeric or all.")
+    import pyarrow.parquet as pq
+
+    root = Path(path)
+    files = sorted((root / "data").rglob("*.parquet"))
+    keys = ("index", "language.primitive_id", "language.magnitude_bin_id",
+            "language.target_delta_si")
+    if not files or any(not set(keys).issubset(pq.read_schema(file).names) for file in files):
+        raise ValueError(f"Dataset does not contain language command supervision required by style={style!r}.")
+    rows = [pq.read_table(file, columns=list(keys)).to_pydict() for file in files]
+    indices = np.concatenate([np.asarray(row["index"], dtype=np.int64) for row in rows])
+    primitive = np.concatenate([np.asarray(row["language.primitive_id"], dtype=np.int64) for row in rows])
+    magnitude = np.concatenate([np.asarray(row["language.magnitude_bin_id"], dtype=np.int64) for row in rows])
+    target = np.concatenate([np.asarray(row["language.target_delta_si"], dtype=np.float32) for row in rows])
+    order = np.argsort(indices)
+    if not np.array_equal(indices[order], np.arange(len(indices))):
+        raise ValueError("Language rows must cover global dataset indices exactly once.")
+    primitive, magnitude, target = primitive[order], magnitude[order], target[order]
+    if (primitive.ndim != 1 or magnitude.ndim != 1 or target.shape != (len(indices), 3)
+            or np.any((primitive < 0) | (primitive >= 6))
+            or np.any((magnitude < 0) | (magnitude >= 3)) or not np.isfinite(target).all()):
+        raise ValueError("Language command IDs or target deltas are invalid.")
+    features = np.zeros((len(indices), 12), dtype=np.float32)
+    features[np.arange(len(indices)), primitive] = 1.
+    if style in {"graded", "all"}:
+        features[np.arange(len(indices)), 6 + magnitude] = 1.
+    if style in {"numeric", "all"}:
+        features[:, 9:12] = target / np.asarray([.012, .012, np.deg2rad(6)], dtype=np.float32)
+    return features
+
+
 def split_episode_masks(
     n_episodes: int,
     val_ratio: float = 0.02,
     seed: int = 42,
     max_train_episodes: int | None = None,
+    *,
+    groups: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if n_episodes < 2:
         raise ValueError("At least two episodes are required.")
@@ -266,6 +366,28 @@ def split_episode_masks(
     if max_train_episodes is not None and max_train_episodes < 1:
         raise ValueError("max_train_episodes must be positive.")
     rng = np.random.default_rng(seed)
+    if groups is not None:
+        groups = np.asarray(groups)
+        if groups.shape != (n_episodes,) or groups.dtype.kind not in "iu":
+            raise ValueError("Episode groups must be an integer array with one ID per episode.")
+        unique = np.unique(groups)
+        if len(unique) < 2:
+            raise ValueError("At least two independent episode groups are required for validation.")
+        count = min(max(1, round(len(unique) * val_ratio)), len(unique) - 1)
+        validation_groups = rng.choice(unique, size=count, replace=False)
+        val_mask = np.isin(groups, validation_groups)
+        train_mask = ~val_mask
+        if max_train_episodes is not None and train_mask.sum() > max_train_episodes:
+            # Keep complete groups, even for small smoke-run budgets.
+            selected = np.zeros(n_episodes, dtype=bool)
+            for group in rng.permutation(unique[~np.isin(unique, validation_groups)]):
+                candidate = groups == group
+                if selected.sum() + candidate.sum() <= max_train_episodes:
+                    selected |= candidate
+            if not selected.any():
+                raise ValueError("max_train_episodes is smaller than every complete training pair group.")
+            train_mask = selected
+        return train_mask, val_mask
     n_val = min(max(1, round(n_episodes * val_ratio)), n_episodes - 1)
     val_indices = rng.choice(n_episodes, size=n_val, replace=False)
     val_mask = np.zeros(n_episodes, dtype=bool)
@@ -323,6 +445,8 @@ class SequenceDataset(Dataset):
         episode_mask: np.ndarray | None = None,
         *,
         images: np.ndarray | None = None,
+        language: np.ndarray | None = None,
+        instructions: np.ndarray | None = None,
         sample_mask: np.ndarray | None = None,
     ) -> None:
         self.observations = np.asarray(observations, dtype=np.float32)
@@ -340,6 +464,15 @@ class SequenceDataset(Dataset):
             self.images.shape[-1] != 3 or min(self.images.shape[1:]) < 1 or self.images.dtype != np.uint8
         ):
             raise ValueError("images must be uint8 RGB [N, H, W, 3] aligned with the state/action rows.")
+        self.language = None if language is None else np.asarray(language, dtype=np.float32)
+        self.instructions = None if instructions is None else np.asarray(instructions, dtype=object)
+        if self.instructions is not None and (self.instructions.shape != (len(self.actions),)
+                or any(not isinstance(value, str) or not value.strip() for value in self.instructions)):
+            raise ValueError("instructions must contain one nonempty text per state/action row.")
+        if self.language is not None and (self.language.ndim != 2 or len(self.language) != len(self.actions)
+                                          or self.language.shape[1] != 12
+                                          or not np.isfinite(self.language).all()):
+            raise ValueError("language must be finite float32 [N, 12] aligned with state/action rows.")
         if episode_mask is None:
             episode_mask = np.ones(len(self.episode_ends), dtype=bool)
         self.episode_mask = np.asarray(episode_mask, dtype=bool)
@@ -402,5 +535,16 @@ class SequenceDataset(Dataset):
             # frames instead of all H frames in the action prediction horizon.
             images = self._padded_slice(self.images, index, self.config.obs_horizon)
             sample["obs"] = {"state": sample["obs"], "image": torch.from_numpy(images.transpose(0, 3, 1, 2))}
+        if self.language is not None:
+            language = torch.from_numpy(self._padded_slice(self.language, index, self.config.obs_horizon))
+            if isinstance(sample["obs"], dict):
+                sample["obs"]["language"] = language
+            else:
+                sample["obs"] = {"state": sample["obs"], "language": language}
+        if self.instructions is not None:
+            if not isinstance(sample["obs"], dict):
+                sample["obs"] = {"state": sample["obs"]}
+            sample["obs"]["instruction"] = self._padded_slice(
+                self.instructions, index, self.config.obs_horizon).tolist()
         return sample
 

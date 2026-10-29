@@ -19,13 +19,17 @@ class EncoderConfig:
     freeze_backbone: bool | None = None
     model_name: str = "Qwen/Qwen3-VL-2B-Instruct"
     vision_config: dict | None = None
+    vlm_config: dict | None = None
+    processor_config: dict | None = None
+    state_indices: list[int] | None = None
 
     def __post_init__(self):
-        if self.name not in {"identity", "mlp", "resnet", "qwen"}:
+        if self.name not in {"identity", "mlp", "resnet", "qwen", "qwen_vlm"}:
             raise ValueError(f"Unknown obsencoder {self.name!r}; choose identity, mlp, resnet or qwen.")
-        if self.input_mode not in {"structured_state", "partial_obs"}:
+        if self.input_mode not in {"structured_state", "partial_obs", "multimodal"}:
             raise ValueError("input_mode must be structured_state or partial_obs.")
-        expected_mode = "partial_obs" if self.name in {"resnet", "qwen"} else "structured_state"
+        expected_mode = ("multimodal" if self.name == "qwen_vlm" else
+                         "partial_obs" if self.name in {"resnet", "qwen"} else "structured_state")
         if self.input_mode != expected_mode:
             raise ValueError(f"Encoder {self.name!r} requires input_mode={expected_mode!r}.")
         if type(self.hidden_dim) is not int or self.hidden_dim < 1:
@@ -40,6 +44,10 @@ class EncoderConfig:
             raise ValueError("freeze_backbone must be boolean or None.")
         if not isinstance(self.image_key, str) or not self.image_key.startswith("observation.images."):
             raise ValueError("image_key must name a LeRobot observation.images camera.")
+        if self.state_indices is not None and (not isinstance(self.state_indices, (list, tuple))
+                or not self.state_indices or any(type(i) is not int or i < 0 for i in self.state_indices)
+                or len(set(self.state_indices)) != len(self.state_indices)):
+            raise ValueError("state_indices must contain unique nonnegative state channel indices.")
 
 class ObservationEncoder(nn.Module, ABC):
     def __init__(self, obs_min, obs_max, config: EncoderConfig):
@@ -113,4 +121,7 @@ def create_obsencoder(obs_min, obs_max, config: EncoderConfig, *, pretrained=Tru
     if config.name == "qwen":
         from .qwen import QwenObservationEncoder
         return QwenObservationEncoder(obs_min, obs_max, config, pretrained=pretrained)
+    if config.name == "qwen_vlm":
+        from .qwen_vlm import QwenVLMObservationEncoder
+        return QwenVLMObservationEncoder(obs_min, obs_max, config, pretrained=pretrained)
     raise ValueError(f"Unknown obsencoder {config.name!r}.")

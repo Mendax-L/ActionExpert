@@ -1,11 +1,12 @@
 data:
-  dataset: ../../pushenv/training_data/lerobot/pusht
+  dataset: ../../ReposeEnv/training_data/lerobot/pusht
   env_name: pusht
 obsencoder:
-  input_mode: partial_obs
-  name: qwen
+  input_mode: multimodal
+  name: qwen_vlm
   model_name: Qwen/Qwen3-VL-2B-Instruct
   freeze_backbone: true
+  state_indices: [18, 19]
 policy:
   name: flowmatching
   flowmatching:

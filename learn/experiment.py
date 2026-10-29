@@ -8,11 +8,13 @@ import yaml
 
 
 SECTIONS = {
-    "data": {name: name for name in ("dataset", "contract", "env_name", "video_width", "sample_phase")},
+    "data": {name: name for name in ("dataset", "contract", "env_name", "video_width", "sample_phase",
+                                               "language_style", "instruction")},
     "obsencoder": {
         "name": "obsencoder_name", "output_dim": "encoder_output_dim", "hidden_dim": "encoder_hidden_dim",
         "image_key": "image_key", "image_size": "image_size", "model_name": "qwen_model",
         "input_mode": "input_mode", "freeze_backbone": "freeze_backbone", "pretrained": "pretrained",
+        "state_indices": "state_indices",
     },
     "policy": {"name": "policy_name", "obs_horizon": "obs_horizon", "action_horizon": "action_horizon"},
     "training": {name: name for name in (
