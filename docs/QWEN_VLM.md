@@ -8,17 +8,17 @@
 
 | 输入 | 训练来源 | 推理来源 |
 | --- | --- | --- |
-| 图像 | `obsencoder.image_key` 对应的 LeRobot 视频 | `obs.image`：原有 RGB uint8 历史的 shape＋base64 数据 |
-| 自然语言 | 每帧 `task_index` → `meta/tasks.parquet` 的 `task` 文本，也支持 pandas 字符串索引；`data.instruction` 可指定整批固定任务 | 请求顶层或 `obs` 内的 `instruction`；支持一个字符串或长度等于历史帧数的字符串列表 |
-| 机器人状态 | `observation.state`，按 `obsencoder.state_indices` 选通道 | `obs["observation.state"]`，维数和顺序与训练数据一致 |
+| 图像 | `obsencoder.image_key` 对应的 LeRobot 视频 | `obs.env["images.camera2"]` 等命名字段，RGB uint8 历史的 shape＋base64 数据；兼容旧 `obs.image` |
+| 自然语言 | 每帧 `task_index` → `meta/tasks.parquet` 的任务文本，也支持 pandas 字符串索引；`data.instruction` 可指定整批固定任务 | `obs.env.instruction`；兼容请求顶层或 `obs` 内的 `instruction`，支持字符串或与历史等长的列表 |
+| 机器人状态 | `observation.state`，按 `obsencoder.state_indices` 选通道 | `obs.robot_state` 中的 `robot.*` 字段，按 checkpoint 保存的接口 YAML 顺序拼接；兼容旧 `obs["observation.state"]` |
 
 图像、语言和状态使用相同的动作前时刻及历史窗口，轨迹边界重复首帧，不跨轨迹。语言进入 tokenizer 和语言模型，原有 `language_style` 的 12 维消融向量是独立的兼容功能，不代替自然语言。
 
-`state_indices` 不填写时使用所有传入状态通道；机器人观测的选择由数据配置定义，模型不按环境名猜测字段。`configs/alignbox3d_qwen_vlm.yaml` 只使用实际反馈，每臂为实际末端 XYZ（3）、实际 WXYZ 四元数（4）、夹爪实际行程（1），inner、outer 各 8 维，共 16 维；箱体、关节、接触力和控制器目标均不进入状态分支。`configs/pusht_qwen.yaml` 只选 agent 的 XY。现场状态需采用相同单位和顺序，数值归一化参数由训练集保存。
+`state_indices` 不填写时使用所有传入状态通道；新数据按 ReposeEnv YAML 的 `observation.robot_state` 顺序保存状态。AlignBox3D 使用 `robot.left_end_effector_pos/rot6d`、`robot.left_gripper` 以及对应的 right 字段，共 20 维；PushT 使用 `robot.agent_pos` 的 XY，共 2 维。相机在在线接口中叫 `images.camera2`，落盘时叫 `observation.images.camera2`。现场状态需采用相同单位和顺序，数值归一化参数由训练集保存。
 
-时间关系为：动作前实际观测 `obs_t` → 模型预测 `action_t` → 环境更新控制器目标并执行 → 下一帧实际观测。训练时，示范数据中的 `action_t` 是监督标签；部署时由模型输出。当前 14 维动作是双臂各 6 维世界坐标系位姿增量与 1 维夹爪绝对开度，环境再将其转换为目标位姿和目标行程。录制观测中的 `tip_targets`、`tip_target_rotations`、`gripper_targets` 是动作前控制器保留的目标，与当前动作标签的时间含义不同；本配置不把这些目标作为模型输入。
+时间关系为：动作前实际观测 `obs_t` → 模型预测 `action_t` → 环境更新控制器目标并执行 → 下一帧实际观测。新 AlignBox3D 接口的 12 维动作是左右各 XYZ 与局部 RPY 增量，夹爪由采集专家或遥操作控制。RPY 按 roll、pitch、yaw 排列，metadata 显式保存该顺序及 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。旋转观测后缀支持 `rot6d`、`wxyz`、`rotm`。
 
-输入顺序为 `[inner.x,y,z,qw,qx,qy,qz,gripper_actual, outer.x,y,z,qw,qx,qy,qz,gripper_actual]`，位置和夹爪行程单位为米。原始协议仍可携带完整 66 维状态用于契约检查，模型数值分支仅接收选定的 16 维；环境代码无需改动。旧 checkpoint 按其保存的输入配置恢复，新 16 维配置应重新训练，不会自动改变旧模型结构。
+输入顺序由数据集的 `interface` 和 `interface_features` 保存并随 checkpoint 恢复，不能用字典插入顺序代替 YAML 顺序。命名字段缺失、shape 不符或契约不一致会明确报错。原有 66 维数据和 checkpoint 保持原契约，新命名接口及 60 Hz 数据需重新训练。
 
 ## 训练与服务
 
@@ -29,11 +29,11 @@ Set-Location Z:\ActionExpert
 python -m learn.train --config configs\alignbox3d_qwen_vlm.yaml
 ```
 
-该配置用 camera2、128 像素宽的视频、224 像素的 VLM 输入、16 个实际机器人状态通道和固定完整任务指令。完整指令避免训练时使用专家阶段标签、部署时却缺少阶段信息的问题。也可提供其他数据路径，或在自己的 YAML 中选择相机与状态通道；环境编号和状态语义仅在配置和数据契约中声明。
+该配置用 camera2、128 像素宽的视频、224 像素的 VLM 输入、20 个实际机器人状态通道和固定完整任务指令。完整指令避免训练时使用专家阶段标签、部署时却缺少阶段信息的问题。也可提供其他数据路径，或在自己的 YAML 中选择相机与状态通道；环境编号和状态语义仅在配置和数据契约中声明。
 
 首次训练需要下载 2B 预训练权重和处理器，可用 `--qwen-model` 指定本地模型目录。`--no-pretrained` 只用于随机权重的流程验证，不能提供预训练图文理解能力。模型 checkpoint 保存 VLM 权重、结构、tokenizer、图像处理设置和状态归一化，因此推理恢复不需要联网；完整 checkpoint 也会包含冻结的 VLM 权重，体积相应增加。视频仍整批解码到内存，可减小 `video_width` 控制占用。
 
-启动模型服务，并为当前未发送文本的环境客户端指定默认指令：
+启动模型服务；环境客户端会发送 `env.instruction`，也可以为兼容客户端设置默认指令：
 
 ```powershell
 python inference.py outputs\alignbox3d\qwen_vlm_run01\best.pt `

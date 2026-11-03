@@ -73,6 +73,9 @@ def load_dataset(path: str | Path, contract_path: str | Path | None = None):
             "observation_layout": schema.get("observation_layout"),
             "action_semantics": schema.get("action_semantics"),
             "environment": schema.get("environment"), "fps": info.get("fps")})
+        for key in ("interface", "interface_features", "interface_semantics", "action_groups"):
+            if key in schema:
+                contract[key] = schema[key]
         for key in ("observation.state", "action"):
             if schema.get("features", {}).get(key) != {name: value for name, value in features[key].items() if name != "fps"}:
                 raise ValueError(f"info.json and pushenv_schema.json disagree at {key}.")

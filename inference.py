@@ -12,7 +12,7 @@ import threading
 import numpy as np
 import torch
 
-from interact.env_protocol import PROTOCOL_VERSION, PolicyServer, unpack_image, validate_contract, interaction_output
+from interact.env_protocol import PROTOCOL_VERSION, PolicyServer, validate_contract, interaction_output
 from interact.action_execution import ActionExecution, ActionStandardizer
 from interact.obs_pool import ObsPool
 from obsencoder.encoder import EncoderConfig, create_obsencoder
@@ -40,7 +40,9 @@ class PolicySession:
         self.multimodal = encoder.config.input_mode == "multimodal"
         image_shape = encoder.config.image_shape if encoder.config.input_mode in {"partial_obs", "multimodal"} else None
         self.pool = ObsPool(policy.config.obs_horizon, policy.config.obs_dim, image_shape,
-                            encoder.config.image_key, require_instruction=self.multimodal)
+                            encoder.config.image_key, require_instruction=self.multimodal,
+                            robot_fields=self.contract.get("interface", {}).get("observation", {}).get("robot_state"),
+                            interface_features=self.contract.get("interface_features"))
         self.generator = torch.Generator(device=policy.device).manual_seed(seed)
 
     def __call__(self, request):
@@ -75,19 +77,9 @@ class PolicySession:
             self.pool.clear()
             return {"ok": True}
         if operation == "predict":
-            value = request["obs"]
-            image = None
-            instruction = request.get("instruction", self.instruction)
-            if isinstance(value, dict):
-                instruction = value.get("instruction", instruction)
-                if self.pool.image_shape is not None:
-                    state = np.asarray(value["observation.state"], dtype=np.float32)
-                    count = 1 if state.ndim == 1 else self.pool.obs_horizon
-                    raw, shape = unpack_image(value["image"], (count, *self.pool.image_shape))
-                    image = np.frombuffer(raw, dtype=np.uint8).reshape(shape)
-                    if state.ndim == 1:
-                        image = image[0]
-                value = value["observation.state"]
+            value, image, instruction = self.pool._values(request["obs"])
+            if instruction is None:
+                instruction = request.get("instruction", self.instruction)
             observations = np.asarray(value, dtype=np.float32)
             if self.encoder.config.input_mode == "partial_obs":
                 observations = np.zeros_like(observations)

@@ -129,6 +129,24 @@ def validate_contract(contract):
         indices.extend(group)
     if groups and sorted(indices) != list(range(value["action_dim"])):
         raise ValueError("Action groups must partition all channels exactly once.")
+    if "interface" in value:
+        interface, features = value["interface"], value.get("interface_features", {})
+        if (not isinstance(interface, dict) or not isinstance(features, dict)
+                or not isinstance(interface.get("observation"), dict)):
+            raise ValueError("Named interfaces require observation groups and feature metadata.")
+        for fields, dimension in ((interface.get("action"), value["action_dim"]),
+                                  (interface["observation"].get("robot_state"), value["obs_dim"])):
+            if (not isinstance(fields, list) or not fields or any(not isinstance(key, str) for key in fields)
+                    or len(set(fields)) != len(fields)):
+                raise ValueError("Interface fields must be ordered, unique names.")
+            sizes = []
+            for key in fields:
+                shape = features.get(key, {}).get("shape", [])
+                if len(shape) != 1 or type(shape[0]) is not int or shape[0] < 1:
+                    raise ValueError(f"Missing vector metadata for {key}.")
+                sizes.append(shape[0])
+            if sum(sizes) != dimension:
+                raise ValueError("Named interface dimensions differ from the flattened contract.")
     return value
 
 
@@ -256,6 +274,7 @@ def success_status(environment, info):
 
 
 def run_rollout(connection, environment, health, episodes, seed, max_steps, video_dir=None, show=False):
+    from collections import deque
     import numpy as np
     from interact.obs_pool import ObsPool
 
@@ -289,11 +308,13 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
         if tuple(image_shape) != source_image_shape:
             import cv2
     pool = ObsPool(obs_shape[0], environment.obs_dim, image_shape, image_key)
+    named = bool(contract.get("interface"))
+    named_history = deque(maxlen=obs_shape[0])
     spatial = environment.name == "alignbox3d"
     input_mode = health.get("input_mode")
-    if input_mode not in {"structured_state", "partial_obs"}:
-        raise ValueError("Policy input_mode must be structured_state or partial_obs.")
-    if (input_mode == "partial_obs") != (image_shape is not None):
+    if input_mode not in {"structured_state", "partial_obs", "multimodal"}:
+        raise ValueError("Unsupported policy input_mode.")
+    if (input_mode in {"partial_obs", "multimodal"}) != (image_shape is not None):
         raise ValueError("Policy input mode disagrees with its image/state configuration.")
     policy_input = {"mode": input_mode, "image_key": image_key if image_shape is not None else None,
                     "image_shape": image_shape, "state_dim": 0 if input_mode == "partial_obs" else environment.obs_dim}
@@ -333,18 +354,53 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
         preview_clock.tick(environment.fps)
 
     def observe(state):
+        if named:
+            fields = environment.interface_observation()
+            public_image_key = image_key.removeprefix("observation.")
+            if image_shape is not None:
+                image = np.asarray(fields[public_image_key])
+                if image.shape != source_image_shape or image.dtype != np.uint8:
+                    raise ValueError("Rendered RGB pixels differ from the environment camera schema.")
+                if tuple(image_shape) != source_image_shape:
+                    image = cv2.resize(image, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_AREA)
+                fields[public_image_key] = image
+            return fields
         if image_shape is None:
             return state
         observation = environment.observe(include_images=True)
-        image = np.asarray(observation[image_key])
+        # New environment interface: {robot_state: ..., env: {...}}.
+        # Accept the legacy flat observation mapping as well.
+        env_observation = observation.get("env") if isinstance(observation, dict) else None
+        if isinstance(env_observation, dict):
+            image = np.asarray(env_observation[image_key])
+        else:
+            image = np.asarray(observation[image_key])
         if image.shape != source_image_shape or image.dtype != np.uint8:
             raise ValueError("Rendered RGB pixels differ from the environment camera schema.")
         if tuple(image_shape) != source_image_shape:
             image = cv2.resize(image, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_AREA)
-        return {"observation.state": np.zeros(environment.obs_dim, dtype=np.float32),
-                image_key: image}
+        return {"observation.state": (np.zeros(environment.obs_dim, dtype=np.float32)
+                                       if input_mode == "partial_obs" else state),
+                image_key: image, "instruction": getattr(environment, "instruction", None)}
+
+    def append_observation(state):
+        observation = observe(state)
+        if named:
+            named_history.append(observation)
+        else:
+            pool.append(observation)
 
     def policy_observation():
+        if named:
+            frames = [named_history[0]] * (obs_shape[0] - len(named_history)) + list(named_history)
+            result = {}
+            for group, fields in contract["interface"]["observation"].items():
+                result[group] = {}
+                for field in fields:
+                    values = [frame[field] for frame in frames]
+                    result[group][field] = (pack_image(np.stack(values)) if field.startswith("images.")
+                                            else values if field == "instruction" else np.stack(values).tolist())
+            return result
         observation = pool.observation()
         if image_shape is None:
             return observation.tolist()
@@ -365,7 +421,8 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
         episode_seed = seed + episode
         exchange(connection, {"op": "reset", "seed": episode_seed})
         pool.clear()
-        pool.append(observe(environment.reset(episode_seed)))
+        named_history.clear()
+        append_observation(environment.reset(episode_seed))
         writers, video_paths = {}, {}
         video_stack = ExitStack()
         total_reward, score, steps = 0.0, float("-inf"), 0
@@ -386,7 +443,7 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
         def consume(action, plan_index, plan_length):
             nonlocal total_reward, score, steps, success, success_known, terminated, truncated, final_info
             transition = environment.step(action)
-            pool.append(observe(transition.obs))
+            append_observation(transition.obs)
             reward = float(transition.reward)
             if not np.isfinite(reward):
                 raise ValueError("Environment reward must be finite.")
@@ -508,9 +565,12 @@ def main():
             image_shape = health.get("image_shape")
             if image_shape is not None:
                 _image_history_shape([health["obs_shape"][0], *image_shape])
-            # camera2 recordings use the original 512-wide closeup camera;
-            # resize after rendering exactly as dataset video ingestion does.
-            render_size = 512 if health.get("image_key") == "observation.images.camera2" else image_shape[1] if image_shape else None
+            # Render the recorded camera geometry before model-side resizing.
+            public_image_key = health.get("image_key", "observation.images.front").removeprefix("observation.")
+            source_shape = health.get("contract", {}).get("interface_features", {}).get(public_image_key, {}).get("shape")
+            render_size = (source_shape[1] if source_shape else 512
+                           if health.get("image_key") == "observation.images.camera2"
+                           else image_shape[1] if image_shape else None)
             environment = make_environment(args.env_name, render_size=render_size)
             try:
                 report = run_rollout(connection, environment, health, args.episodes, args.seed, args.max_steps,

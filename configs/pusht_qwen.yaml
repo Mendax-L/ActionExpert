@@ -6,7 +6,8 @@ obsencoder:
   name: qwen_vlm
   model_name: Qwen/Qwen3-VL-2B-Instruct
   freeze_backbone: true
-  state_indices: [18, 19]
+  # The new interface dataset contains only the selected robot.agent_pos (XY).
+  state_indices: null
 policy:
   name: flowmatching
   flowmatching:

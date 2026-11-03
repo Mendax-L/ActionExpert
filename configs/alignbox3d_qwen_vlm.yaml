@@ -12,10 +12,8 @@ obsencoder:
   output_dim: 256
   hidden_dim: 128
   freeze_backbone: true
-  # Actual feedback only, inner then outer:
-  # XYZ (3) + quaternion WXYZ (4) + measured gripper travel (1) per arm.
-  state_indices: [37, 38, 39, 58, 59, 60, 61, 54,
-                  40, 41, 42, 62, 63, 64, 65, 55]
+  # All measured robot fields in the dataset's interface YAML order.
+  state_indices: null
 policy:
   name: flowmatching
   obs_horizon: 2

@@ -8,7 +8,8 @@ import numpy as np
 
 class ObsPool:
     def __init__(self, obs_horizon: int, obs_dim: int, image_shape=None,
-                 image_key="observation.images.front", require_instruction=False):
+                 image_key="observation.images.front", require_instruction=False,
+                 robot_fields=None, interface_features=None):
         if any(type(value) is not int or value < 1 for value in (obs_horizon, obs_dim)):
             raise ValueError("obs_horizon and obs_dim must be positive integers.")
         self.obs_horizon, self.obs_dim = obs_horizon, obs_dim
@@ -24,6 +25,8 @@ class ObsPool:
         self._history = deque(maxlen=obs_horizon)
         self._images = deque(maxlen=obs_horizon)
         self.require_instruction = require_instruction
+        self.robot_fields = tuple(robot_fields or ())
+        self.interface_features = interface_features or {}
         self._instructions = deque(maxlen=obs_horizon)
 
     def clear(self):
@@ -33,12 +36,41 @@ class ObsPool:
 
     def _values(self, observation):
         if isinstance(observation, Mapping):
-            state = observation.get("state", observation.get("observation.state"))
-            image = observation.get("image", observation.get(self.image_key))
-            instruction = observation.get("instruction")
+            # Environment adapters may expose the observation as
+            # {"robot_state": ..., "env": {...}}.  Keep accepting the
+            # historical flat {"state": ..., "image": ...} shape too.
+            state = observation.get("robot_state", observation.get("state", observation.get("observation.state")))
+            if isinstance(state, Mapping):
+                if not self.robot_fields or set(state) != set(self.robot_fields):
+                    raise ValueError("robot_state fields must match the checkpoint's YAML selection.")
+                parts = []
+                for field in self.robot_fields:
+                    value = np.asarray(state[field], dtype=np.float32)
+                    shape = tuple(self.interface_features[field]["shape"])
+                    if value.ndim not in (1, 2) or value.shape[-1:] != shape:
+                        raise ValueError(f"Robot field {field} must have shape {shape} or [history, {shape[0]}].")
+                    if parts and value.shape[:-1] != parts[0].shape[:-1]:
+                        raise ValueError("Robot fields must share the same history length.")
+                    parts.append(value)
+                state = np.concatenate(parts, axis=-1)
+            environment = observation.get("env")
+            if isinstance(environment, Mapping):
+                image = environment.get(self.image_key.removeprefix("observation."),
+                                        environment.get("image", environment.get(self.image_key)))
+            else:
+                image = observation.get("image", observation.get(self.image_key))
+            instruction = (environment.get("instruction", observation.get("instruction"))
+                           if isinstance(environment, Mapping) else observation.get("instruction"))
         else:
             state, image = observation, None
             instruction = None
+        if self.image_shape is not None and isinstance(image, Mapping):
+            from interact.env_protocol import unpack_image
+            count = 1 if np.asarray(state).ndim == 1 else self.obs_horizon
+            raw, shape = unpack_image(image, (count, *self.image_shape))
+            image = np.frombuffer(raw, dtype=np.uint8).reshape(shape)
+            if np.asarray(state).ndim == 1:
+                image = image[0]
         return state, image, instruction
 
     def _instruction(self, value):
