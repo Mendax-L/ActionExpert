@@ -147,6 +147,19 @@ def validate_contract(contract):
                 sizes.append(shape[0])
             if sum(sizes) != dimension:
                 raise ValueError("Named interface dimensions differ from the flattened contract.")
+    if "timing" in value:
+        timing = value["timing"]
+        if not isinstance(timing, dict) or any(type(timing.get(key)) is not int or timing[key] <= 0
+                for key in ("policy_hz", "recording_hz", "control_hz", "physics_hz")):
+            raise ValueError("Timing frequencies must be positive integers.")
+        if (timing["policy_hz"] != value.get("fps") or timing["recording_hz"] != value.get("fps")
+                or timing["control_hz"] % timing["policy_hz"]
+                or timing["physics_hz"] % timing["control_hz"]):
+            raise ValueError("Contract timing must match fps and use integral control/physics ratios.")
+        interface = value.get("interface", {})
+        for field, frequency in (("fps", "policy_hz"), ("control_hz", "control_hz"), ("physics_hz", "physics_hz")):
+            if field in interface and interface[field] != timing[frequency]:
+                raise ValueError(f"Interface and timing disagree at {field}.")
     return value
 
 
@@ -486,7 +499,7 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
             capture({})
             while steps < max_steps and not (terminated or truncated):
                 if spatial and environment.environment.phase != "control":
-                    actions = np.zeros((1, environment.action_dim), dtype=np.float32)
+                    actions = environment.hold_action()[None, :]
                 else:
                     response = exchange(connection, {"op": "predict", "obs": policy_observation()})
                     actions = np.asarray(response["action"], dtype=np.float32)
@@ -505,7 +518,7 @@ def run_rollout(connection, environment, health, episodes, seed, max_steps, vide
                     # lowering and 0.5 s of stable landing have completed.
                     environment.request_finish("max_steps")
                     for _ in range(environment.fps * 60):
-                        transition = consume(np.zeros(environment.action_dim, dtype=np.float32), 0, 1)
+                        transition = consume(environment.hold_action(), 0, 1)
                         if transition.done:
                             break
                     else:

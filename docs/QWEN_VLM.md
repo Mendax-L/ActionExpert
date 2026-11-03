@@ -16,9 +16,11 @@
 
 `state_indices` 不填写时使用所有传入状态通道；新数据按 ReposeEnv YAML 的 `observation.robot_state` 顺序保存状态。AlignBox3D 使用 `robot.left_end_effector_pos/rot6d`、`robot.left_gripper` 以及对应的 right 字段，共 20 维；PushT 使用 `robot.agent_pos` 的 XY，共 2 维。相机在在线接口中叫 `images.camera2`，落盘时叫 `observation.images.camera2`。现场状态需采用相同单位和顺序，数值归一化参数由训练集保存。
 
-时间关系为：动作前实际观测 `obs_t` → 模型预测 `action_t` → 环境更新控制器目标并执行 → 下一帧实际观测。新 AlignBox3D 接口的 12 维动作是左右各 XYZ 与局部 RPY 增量，夹爪由采集专家或遥操作控制。RPY 按 roll、pitch、yaw 排列，metadata 显式保存该顺序及 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。旋转观测后缀支持 `rot6d`、`wxyz`、`rotm`。
+时间关系为：动作前实际观测 `obs_t` → 模型预测 `action_t` → 环境更新控制器目标并执行 → 下一帧实际观测。AlignBox3D 的 14 维动作按左臂 XYZ（3）、左臂 RPY（3）、左夹爪（1）、右臂 XYZ（3）、右臂 RPY（3）、右夹爪（1）排列；`action.left_gripper`、`action.right_gripper` 是绝对开度比例，0 全闭、1 全开，映射驱动手指行程 0–44 mm。夹爪观测 `robot.*_gripper` 仍是实测行程（m）。全零动作会闭合夹爪，保持当前开度应使用环境的 `hold_action()`。RPY 按 roll、pitch、yaw 排列，metadata 显式保存该顺序及 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。旋转观测后缀支持 `rot6d`、`wxyz`、`rotm`。
 
-输入顺序由数据集的 `interface` 和 `interface_features` 保存并随 checkpoint 恢复，不能用字典插入顺序代替 YAML 顺序。命名字段缺失、shape 不符或契约不一致会明确报错。原有 66 维数据和 checkpoint 保持原契约，新命名接口及 60 Hz 数据需重新训练。
+AlignBox3D 的策略动作与数据采样为 30 Hz，环境内部以 60 Hz 插值位置、朝向和夹爪目标，以 600 Hz 积分物理；ReposeEnv 的 `config/alignbox3d.yml` 用 `fps/control_hz/physics_hz` 保存这三项设置。归一化 XYZ/RPY 每分量每策略步对应 2 mm/1°，由配置的速度上限除以 `fps` 得到。一次预测可返回多个这样的策略步，模型服务不需要以 60 Hz 发起请求。PushT 保持 10/10/100 Hz。
+
+输入顺序由数据集的 `interface` 和 `interface_features` 保存并随 checkpoint 恢复，`timing` 同时保存 policy/recording/control/physics 四项频率，不能用字典插入顺序代替 YAML 顺序。命名字段缺失、shape 不符或契约不一致会明确报错。原有数据和 checkpoint 保持原契约，新命名接口及 30 Hz、2 mm/1° 动作语义需重新采集和训练。
 
 ## 训练与服务
 

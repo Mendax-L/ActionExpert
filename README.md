@@ -26,13 +26,13 @@ python inference.py --help
 
 | 环境 | 协议状态维数 → 动作维数 | 动作含义 |
 | --- | --- | --- |
-| `pusht` | 20 → 2 | 绝对 XY，范围 `[0, 512]` 像素 |
+| `pusht` | 2 → 2 | 绝对 XY，范围 `[0, 512]` 像素 |
 | `pushbox2d`（历史数据） | 12 → 2 | 共同抓点中心绝对 XY，范围 `[0, 512]` 像素；当前 ReposeEnv 已不提供此任务 |
-| `alignbox3d` | 66 → 14 | 每臂 XYZ/旋转向量增量及夹爪绝对开度 |
+| `alignbox3d` | 20 → 14 | 每臂 XYZ/局部 RPY 增量及夹爪绝对开度 |
 
-AlignBox3D 在 50 Hz 下分别控制两个末端：每个平移分量每步缩放 1 mm，世界旋转向量分量每步缩放 0.5°，夹爪使用 `[0,1]` 的绝对开度比例。旋转动作遵循右手规则；初始夹爪张开，抓取、抬升和放下均由显式末端动作完成。当前状态布局为 `stacked_box_state_yaw_cw_grippers_tool_quaternions/v4`，动作语义为 `dual_ee_world_xyz_rotvec_delta_1mm_0.5deg_gripper_abs_0_1/v4`。
+AlignBox3D 以 30 Hz 执行策略动作并采样数据，环境以 60 Hz 插值更新目标、600 Hz 积分物理；三项频率由 ReposeEnv 的 `config/alignbox3d.yml` 的 `fps/control_hz/physics_hz` 声明。每个平移分量每策略步缩放 2 mm，局部 RPY 按 roll、pitch、yaw 排列，每个分量每策略步缩放 1°；步长由 YAML 的 60 mm/s、30°/s 分量速度上限除以 `fps` 得到。每臂的夹爪 action 是 `[0,1]` 的绝对开度比例，0 全闭、1 全开；全零动作会闭合夹爪，停留应使用环境 `hold_action()`。状态按接口 YAML 选定的 `robot.*` 字段拼接，当前动作语义为 `dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v4`。数据集和 checkpoint 保留接口、物理语义及 `timing` 的 policy/recording/control/physics 四项频率，连接时核对一致性。PushT 保持 10/10/100 Hz。动作序列中的每一步对应一个策略采样间隔，模型请求频率取决于每次执行的动作数。
 
-数据不随本仓库分发。`alignbox3d_camera2*.yaml` 中的路径和筛选值来自旧数据示例；接入当前 ReposeEnv 时用 `--dataset` 指向重新采集的批次，并用 `--sample-phase 0` 选择当前控制阶段。历史三维 checkpoint 使用 54 维状态、3 维动作和 v2 契约，不能用于当前 66／14／v4 环境，需重新训练；PushT 契约保持兼容。采集与校验方法见 [ReposeEnv 使用说明](../ReposeEnv/README.md)。
+数据不随本仓库分发。`alignbox3d_camera2*.yaml` 中的路径和筛选值来自旧数据示例；接入当前 ReposeEnv 时用 `--dataset` 指向重新采集的批次。旧的 54/66 维状态、12 维动作或世界旋转向量 checkpoint 不能直接用于新的 20/14 维局部 RPY 契约；旧 PushT 20 维状态也需匹配其原始数据和环境。采集与校验方法见 [ReposeEnv 使用说明](../ReposeEnv/README.md)。
 
 ## 2. 先跑通训练与推理
 
@@ -106,7 +106,7 @@ python -u -m learn.train --config configs\alignbox3d_camera2.yaml `
 | [alignbox3d_camera2_language.yaml](configs/alignbox3d_camera2_language.yaml) | 历史 12 维动作原语语言条件示例 | 3000 |
 | [pusht_resnet.yaml](configs/pusht_resnet.yaml) | PushT front 图像 → ResNet | 20000 |
 | [pusht_qwen.yaml](configs/pusht_qwen.yaml) | PushT front＋任务文本＋agent XY → 完整 Qwen3-VL | 20000 |
-| [alignbox3d_qwen_vlm.yaml](configs/alignbox3d_qwen_vlm.yaml) | camera2＋任务文本＋16 维实际末端和夹爪状态 → 完整 Qwen3-VL | 3000 |
+| [alignbox3d_qwen_vlm.yaml](configs/alignbox3d_qwen_vlm.yaml) | camera2＋任务文本＋20 维实际末端和夹爪状态 → 完整 Qwen3-VL | 3000 |
 
 `obsencoder.input_mode: multimodal` 配合默认 `qwen_vlm`，联合使用 RGB、自然语言和机器人状态；`structured_state` 配合 `identity` 或 `mlp`；`partial_obs` 配合 `resnet` 或旧 `qwen` 视觉塔，只使用图像。ResNet 默认训练骨干，Qwen 默认冻结骨干；`freeze_backbone` 可覆盖设置，输出投影层仍参与训练。VLM 提取联合隐藏特征，不执行文字生成。
 

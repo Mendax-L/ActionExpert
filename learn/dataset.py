@@ -73,7 +73,7 @@ def load_dataset(path: str | Path, contract_path: str | Path | None = None):
             "observation_layout": schema.get("observation_layout"),
             "action_semantics": schema.get("action_semantics"),
             "environment": schema.get("environment"), "fps": info.get("fps")})
-        for key in ("interface", "interface_features", "interface_semantics", "action_groups"):
+        for key in ("interface", "interface_features", "interface_semantics", "action_groups", "timing"):
             if key in schema:
                 contract[key] = schema[key]
         for key in ("observation.state", "action"):
